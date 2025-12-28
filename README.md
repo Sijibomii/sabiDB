@@ -89,6 +89,7 @@ sub.on("update", rows => {
 
 ## Architecture
 
+<pre>
 ┌──────────────────────────────────────┐
 │ Client SDK (Rust / TypeScript)       │
 │  - SQL execution                     │
@@ -122,7 +123,7 @@ sub.on("update", rows => {
 │  - Page manager                      │
 │  - B+Tree indexes                    │
 └──────────────────────────────────────┘
-
+</pre>
 
 ### Getting Started
 
