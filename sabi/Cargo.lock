@@ -3,5 +3,17 @@
 version = 4
 
 [[package]]
-name = "sabi"
+name = "sabi-core"
+version = "0.1.0"
+
+[[package]]
+name = "sabi-server"
+version = "0.1.0"
+
+[[package]]
+name = "sabi-sql"
+version = "0.1.0"
+
+[[package]]
+name = "sabi-storage"
 version = "0.1.0"
