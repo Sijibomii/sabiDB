@@ -1,7 +1,8 @@
 use uuid::Uuid;
+use serde::{Serialize, Deserialize};
 
 /// Unique transaction identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TxId(Uuid);
 
 impl TxId {
