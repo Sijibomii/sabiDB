@@ -5,7 +5,7 @@ sabi/
 │   ├── sabi-core/          # Shared types, errors, protocol definitions
 │   │   └── src/
 │   │       ├── error.rs
-│   │       ├── ids.rs
+│   │       ├── ids.rs 
 │   │       └── protocol.rs
 │   │
 │   ├── sabi-storage/       # Storage engine

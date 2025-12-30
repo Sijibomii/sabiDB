@@ -3,7 +3,7 @@ use serde::{Serialize, Deserialize};
 
 /// Unique transaction identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TxId(Uuid);
+pub struct TxId(pub Uuid);
 
 impl TxId {
     pub fn new() -> Self {

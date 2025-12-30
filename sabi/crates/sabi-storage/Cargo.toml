@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+sabi-core = { path = "../sabi-core" }
+crc32fast = "1.4"
+uuid = { version = "1", features = ["serde", "v4"] }

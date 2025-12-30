@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(handle_client(socket));
     }
 }
-
+// todo: convert to http server later
 // echo '{"request_id": "f1deab80-dfc1-433d-b0a2-7245b76e74b9", "type": "Query", "sql": "SELECT * FROM users"}' | nc 127.0.0.1 4000
 
 async fn handle_client(mut socket: TcpStream) {
