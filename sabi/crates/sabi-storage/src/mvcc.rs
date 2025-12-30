@@ -1,4 +1,4 @@
-//! MVCC Transaction & Storage Layer
+//! MVCC Transaction & Storage Layer (Multi-Version Concurrency Control (MVCC))
 //!
 //! Guarantees:
 //! - Snapshot isolation
@@ -6,57 +6,55 @@
 //! - Deterministic replay from WAL
 //! - WAL-first durability
 
-use uuid::{Uuid, Builder};
+use uuid::{Uuid};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sabi_core::error::{DbError, Result};
 use sabi_core::TxId;
 
-/* =========================
- * Transaction State
- * ========================= */
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxState {
-    Active,
-    Committed,
-    Aborted,
+    Active,     // Transaction is in progress
+    Committed,  // Transaction successfully completed
+    Aborted,    // Transaction rolled back
 }
-
-/* =========================
- * Transaction Descriptor
- * ========================= */
 
 #[derive(Debug, Clone)]
 pub struct Transaction {
-    pub tx_id: TxId,
-    pub snapshot_tx: TxId,
-    pub state: TxState,
-    pub read_only: bool,
+    pub tx_id: TxId,           // Unique ID for this transaction
+    pub snapshot_tx: TxId,     // Most recent committed transaction when this started
+    pub state: TxState,        // Current state
+    pub read_only: bool,       // Whether transaction only reads
+    pub tx_number: u64,     // Sequential transaction number
 }
 
-/* =========================
- * Versioned Row
- * ========================= */
 
 #[derive(Debug, Clone)]
 pub struct RowVersion {
-    pub created_by: TxId,
-    pub deleted_by: Option<TxId>,
-    pub value: Vec<u8>,
+    pub created_by: TxId,      // Which transaction created this version
+    pub deleted_by: Option<TxId>, // Which transaction deleted this version (tombstone)
+    pub value: Vec<u8>,        // Actual row data
 }
 
-/* =========================
- * MVCC Table Storage
- * ========================= */
+// Instead of updating rows in-place, create new versions. Old versions remain for active readers.
 
 /// Key → versions (newest first)
 pub type VersionChain = Vec<RowVersion>;
 
+/* =========================
+    Key: "user:1"
+Versions: [
+    RowVersion { created_by: tx3, deleted_by: None, value: "Alice v3" },   ← Latest
+    RowVersion { created_by: tx2, deleted_by: Some(tx3), value: "Alice v2" },
+    RowVersion { created_by: tx1, deleted_by: Some(tx2), value: "Alice v1" },
+]
+ * ========================= */
 #[derive(Debug)]
 pub struct MvccTable {
-    rows: BTreeMap<Vec<u8>, VersionChain>,
+    rows: BTreeMap<Vec<u8>, VersionChain>, 
 }
 
 impl MvccTable {
@@ -90,7 +88,7 @@ impl MvccTable {
             },
         );
     }
-
+    // Soft Delete: Marks version as deleted but doesn't remove it.
     pub fn delete(&mut self, key: &[u8], tx: &Transaction) -> Result<()> {
         let versions = self
             .rows
@@ -100,7 +98,7 @@ impl MvccTable {
         // Mark latest visible version as deleted
         for v in versions.iter_mut() {
             if is_visible(v, tx) {
-                v.deleted_by = Some(tx.tx_id);
+                v.deleted_by = Some(tx.tx_id); // Mark as deleted (tombstone)
                 return Ok(());
             }
         }
@@ -109,78 +107,125 @@ impl MvccTable {
     }
 }
 
-/* =========================
- * Transaction Manager
- * ========================= */
 
 pub struct TransactionManager {
-    next_tx: AtomicU64,
-    active: HashMap<TxId, Transaction>,
+    next_tx: AtomicU64,          // Counter for sequential transaction IDs
+    active: Mutex<HashMap<TxId, Transaction>>,  // Active transactions
+    latest_committed: AtomicU64,
+    tx_registry: RwLock<Vec<Option<TxId>>>,
 }
 
 impl TransactionManager {
     pub fn new() -> Self {
         Self {
             next_tx: AtomicU64::new(1),
-            active: HashMap::new(),
+            active: Mutex::new(HashMap::new()),
+
+            // I could have avoided storing tx_registry and latest_committed but the txId is a uuid and its hard to get the last snapshot id
+            tx_registry: RwLock::new(vec![Some(TxId::nil())]),  // Index 0 = nil transaction
+            latest_committed: AtomicU64::new(0),
         }
     }
 
-    /// BEGIN TRANSACTION
-    pub fn begin(&mut self, read_only: bool) -> Transaction {
-        // Generate UUID from sequential counter
-        let next_id = self.next_tx.fetch_add(1, Ordering::SeqCst);
+    /// BEGIN TRANSACTION : Each transaction sees database as it was when previous transaction committed
+    pub fn begin(&self, read_only: bool) -> Transaction {
+        // increment next_tx atomically but returns old value
+        let tx_number = self.next_tx.fetch_add(1, Ordering::SeqCst);
         
-        // Create a UUID from the counter (using version 4 with custom bits)
-        let tx_id = TxId(Uuid::from_u64_pair(next_id, 0)); // Uses high/low 64-bit pairs
+        // Create timestamped ID
+        let tx_id = TxId(Uuid::now_v7());
         
-        // For snapshot, use previous ID
-        let prev_id = if next_id > 0 { next_id - 1 } else { 0 };
-        let snapshot = TxId(Uuid::from_u64_pair(prev_id, 0));
-
+        // Store in registry - must write lock first
+        {
+            let mut registry = self.tx_registry.write().unwrap();
+            // Ensure registry is big enough
+            if registry.len() <= tx_number as usize {
+                registry.resize(tx_number as usize + 1, None);
+            }
+            registry[tx_number as usize] = Some(tx_id);
+        }
+        
+        // Get snapshot (previous transaction)
+        let snapshot = {
+            let registry = self.tx_registry.read().unwrap();
+            if tx_number > 1 {  // Note: > 1 because tx_number starts at 1
+                // Get the actual previous transaction ID
+                registry[(tx_number - 1) as usize].unwrap_or(TxId::nil())
+            } else {
+                // tx_number = 1 gets snapshot of nil/initial transaction
+                TxId::nil()
+            }
+        };
+        
+        // Create transaction
         let tx = Transaction {
             tx_id,
             snapshot_tx: snapshot,
             state: TxState::Active,
             read_only,
+            tx_number,
         };
-
-        self.active.insert(tx_id, tx.clone());
+        
+        // Store in active transactions
+        self.active.lock().unwrap().insert(tx_id, tx.clone());
+        
         tx
     }
 
     /// COMMIT TRANSACTION
-    pub fn commit(&mut self, tx_id: TxId) -> Result<()> {
-        let tx = self
-            .active
-            .get_mut(&tx_id)
+    pub fn commit(&self, tx_id: TxId) -> Result<()> {
+        // Acquires exclusive lock on active transactions. Prevents concurrent commit/abort operations
+        let mut active = self.active.lock().unwrap();
+        
+        // Find and update the transaction
+        // Ensures transaction exists and is active. Prevents committing already committed/aborted transactions
+        let tx = active.get_mut(&tx_id)
             .ok_or_else(|| DbError::InvalidTransaction(format!(
-            "Cannot commit transaction {}: not found or not active", tx_id
+                "Cannot commit transaction {}: not found or not active", tx_id
             )))?;
-
+        
+        // Validate transaction state
+        if tx.state != TxState::Active {
+            return Err(DbError::InvalidTransaction(format!(
+                "Transaction {} is not active (state: {:?})", tx_id, tx.state
+            )));
+        }
+        
+        // Update state
         tx.state = TxState::Committed;
-        self.active.remove(&tx_id);
+        
+        // Update latest committed transaction number
+        self.latest_committed.store(tx.tx_number, Ordering::SeqCst);
+        
+        // Remove from active
+        active.remove(&tx_id);
+        
         Ok(())
     }
 
     /// ABORT TRANSACTION
-    pub fn abort(&mut self, tx_id: TxId) -> Result<()> {
-        let tx = self
-            .active
-            .get_mut(&tx_id)
+    pub fn abort(&self, tx_id: TxId) -> Result<()> {
+        let mut active = self.active.lock().unwrap();
+        
+        let tx = active.get_mut(&tx_id)
             .ok_or_else(|| DbError::InvalidTransaction(format!(
                 "Cannot abort transaction {}: not found or not active", tx_id
             )))?;
-
+        
+        if tx.state != TxState::Active {
+            return Err(DbError::InvalidTransaction(format!(
+                "Transaction {} is not active (state: {:?})", tx_id, tx.state
+            )));
+        }
+        
         tx.state = TxState::Aborted;
-        self.active.remove(&tx_id);
+        active.remove(&tx_id);
+        
         Ok(())
     }
+    
 }
 
-/* =========================
- * Visibility Logic
- * ========================= */
 
 #[inline]
 fn is_visible(v: &RowVersion, tx: &Transaction) -> bool {
