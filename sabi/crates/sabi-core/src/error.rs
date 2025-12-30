@@ -6,6 +6,8 @@ pub enum DbError {
     SerializationFailure(String),
     Internal(String),
     Corruption(String),
+    NotFound(String),
+    InvalidTransaction(String),
     Io(std::io::Error),
 }
 
@@ -20,6 +22,8 @@ impl fmt::Display for DbError {
             DbError::SerializationFailure(msg) => write!(f, "Serialization Failure: {}", msg),
             DbError::Internal(msg) => write!(f, "Internal Error: {}", msg),
             DbError::Corruption(msg) => write!(f, "Corruption: {}", msg),
+            DbError::NotFound(msg) => write!(f, "Not Found: {}", msg),
+            DbError::InvalidTransaction(msg) => write!(f, "Invalid Transaction: {}", msg),
             DbError::Io(err) => write!(f, "IO Error: {}", err),
         }
     }
