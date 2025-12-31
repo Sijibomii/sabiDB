@@ -260,3 +260,6 @@ By the end of this roadmap, sabiDB will be:
 - Capable of reactive applications
 - Paired with a clean TypeScript SDK
 
+sabiDB prioritizes **correctness, clarity, and learning** over feature count.
+
+

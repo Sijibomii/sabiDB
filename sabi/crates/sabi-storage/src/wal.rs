@@ -107,7 +107,7 @@ pub enum WalRecord {
         value: Vec<u8>,
     },
     Delete {
-        tx: TxId,
+        tx: TxId, 
         table_id: u32,
         key: Vec<u8>,
     },

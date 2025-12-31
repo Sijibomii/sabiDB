@@ -10,13 +10,15 @@ pub const PAGE_SIZE: usize = 4096; // 4KB page size
 pub const PAGE_MAGIC: &[u8; 4] = b"SABI";
 
 #[repr(u16)] // Ensures exact 2-byte representation
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
     Free = 0,          // Unallocated page
     Data = 1,          // Raw data storage
     BTreeInternal = 2, // B-Tree internal node
     BTreeLeaf = 3,     // B-Tree leaf node
 }   
+
+pub type PageId = u64;
 
 #[derive(Debug, Clone)]
 pub struct PageHeader {
