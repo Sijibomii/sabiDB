@@ -5,6 +5,109 @@ use crate::page::{Page, PageType, PageId};
 use crate::page_file::PageFile;
 use crate::wal::{WalRecord, WalWriter};
 
+/* ============================================================
+    B -Tree+ Overview
+    for internal node
+
+    Each key acts as a separator between child subtrees
+    For n keys, you need n+1 children because:
+    One child for keys less than the first key
+    One child between each pair of keys
+    One child for keys greater than the last key
+
+                    [20, 35, 50]
+                   /    |    |    \
+                  /     |    |     \
+           <20     20-35   35-50    >50
+
+    This node has:
+
+    3 keys (20, 35, 50)
+
+    4 children (pointers to subtrees)
+
+
+    Leaf nodes are where the actual data resides in a B+ tree.
+
+    Internal node: keys + child pointers
+    keys: [20, 35, 50]
+    children: [ptr0, ptr1, ptr2, ptr3]
+
+    Leaf node: keys + actual values  
+    keys: [20, 35, 50]
+    values: [data20, data35, data50]
+
+    Search for key 40:
+    Start at root [25, 55]
+
+    40 > 25 → go right child
+
+    Reach internal node [40, 50] 
+
+    40 ≥ 40 → go to appropriate leaf
+
+    Find key 40 in Leaf3, return its value
+
+
+    Range Query for keys 30-45:
+    Find key 30 (locates Leaf2)
+
+    Scan Leaf2: find 30
+
+    Follow "next" pointer to Leaf3
+
+    Scan Leaf3 until key > 45
+
+    Return values for keys 30, 40
+
+
+    ======= insertion =======
+
+    Insert key 35 with value data35:
+
+    Root: [25, 55]
+    Go to right of 25, left of 55
+    Reach Leaf2: [25, 30] | Next → Leaf3
+
+    Leaf2 before: [25, 30]
+    Leaf2 after:  [25, 30, 35]  (if capacity allows)
+
+    Leaf2: [25, 30, 35, 40]  ← OVERFLOW!
+
+    Split at midpoint:
+    - Left leaf: [25, 30] | Next → Right leaf
+    - Right leaf: [35, 40] | Next → Leaf3
+
+    Promote smallest key from right leaf to parent:
+    Parent before: [25, 55]
+    Parent after:  [25, 35, 55]
+
+
+    ========== deletion ==========
+
+    Delete key 30:
+
+    Leaf2: [25, 30, 35] → Remove 30 → [25, 35]
+
+    If min keys = 2 and Leaf2 now has 1 key:
+
+    Leaf1: [10, 20] | Next → Leaf2
+    Leaf2: [25]     | Next → Leaf3  ← UNDERFLOW!
+
+    Option 1: Redistribute with sibling
+    Leaf1 gives 20 to Leaf2: [10] and [20, 25]
+    Update parent separator from 25 to 20
+
+    Option 2: Merge with sibling  
+    Merge Leaf2 into Leaf1: [10, 20, 25]
+    Remove Leaf2, update parent and next pointers
+
+
+ * ============================================================
+ */
+
+
+
 
 /* ============================================================
  * MVCC decides which version is visible
@@ -22,16 +125,19 @@ use crate::wal::{WalRecord, WalWriter};
  */
 
 const MAX_KEYS: usize = 128;
+const BTREE_TABLE_ID: usize = 1;
+
+// todo: should this be public?? check later
 
 #[derive(Debug, Clone)]
-struct NodeHeader {
+pub struct NodeHeader {
     is_leaf: bool,
     key_count: u16,
     parent: Option<PageId>,
 }
 
 #[derive(Debug, Clone)]
-struct LeafNode {
+pub struct LeafNode {
     header: NodeHeader,
     next: Option<PageId>,
     keys: Vec<Vec<u8>>,
@@ -39,80 +145,85 @@ struct LeafNode {
 }
 
 #[derive(Debug)]
-struct InternalNode {
+pub struct InternalNode {
     header: NodeHeader,
     keys: Vec<Vec<u8>>,
     children: Vec<PageId>,
 }
 
 #[derive(Debug)]
-enum Node {
+pub enum Node {
     Leaf(LeafNode),
     Internal(InternalNode),
 }
 
 // extend WalWriter impl
 impl WalWriter {
-    pub fn log_btree_insert(&mut self, key: &[u8], value: PageId) -> Result<()> {
-        // For BTree operations, we need a proper transaction ID
-        // For now, use a placeholder
-        let dummy_tx = TxId(uuid::Uuid::nil());
-        
+    pub fn log_btree_insert(&mut self, key: &[u8], value: PageId, tx_id: TxId) -> Result<()> {
         let record = WalRecord::Put {
-            tx: dummy_tx,
-            table_id: 1, // Use table_id 1 for BTree operations
+            tx: tx_id,
+            table_id:  BTREE_TABLE_ID as u32,
             key: key.to_vec(),
             value: value.to_le_bytes().to_vec(),
         };
         
         self.append(record)
     }
-    
-    pub fn log_btree_split_leaf(&mut self, leaf_id: PageId) -> Result<()> {
-        let dummy_tx = TxId(uuid::Uuid::nil());
-        let record = WalRecord::Put {
-            tx: dummy_tx,
-            table_id: 2,
-            key: b"split_leaf".to_vec(),
-            value: leaf_id.to_le_bytes().to_vec(),
+
+    pub fn log_btree_delete(&mut self, key: &[u8], tx_id: TxId) -> Result<()> {
+        let record = WalRecord::Delete {
+            tx: tx_id,
+            table_id:  BTREE_TABLE_ID as u32,
+            key: key.to_vec(),
         };
-        
         self.append(record)
     }
+
+    // pub fn log_btree_split_leaf(&mut self, leaf_id: PageId, tx_id: TxId) -> Result<()> {
+    //     let record = WalRecord::Put {
+    //         tx: tx_id,
+    //         table_id: 2,
+    //         key: b"split_leaf".to_vec(),
+    //         value: leaf_id.to_le_bytes().to_vec(),
+    //     };
+        
+    //     self.append(record)
+    // }
     
-    pub fn log_btree_split_internal(&mut self, node_id: PageId) -> Result<()> {
-        let dummy_tx = TxId(uuid::Uuid::nil());
-        let record = WalRecord::Put {
-            tx: dummy_tx,
-            table_id: 3,
-            key: b"split_internal".to_vec(),
-            value: node_id.to_le_bytes().to_vec(),
-        };
+    // pub fn log_btree_split_internal(&mut self, node_id: PageId) -> Result<()> {
+    //     let dummy_tx = TxId(uuid::Uuid::nil());
+    //     let record = WalRecord::Put {
+    //         tx: dummy_tx,
+    //         table_id: 3,
+    //         key: b"split_internal".to_vec(),
+    //         value: node_id.to_le_bytes().to_vec(),
+    //     };
         
-        self.append(record)
-    }
+    //     self.append(record)
+    // }
     
-    pub fn log_btree_new_root(&mut self, left: PageId, right: PageId) -> Result<()> {
-        let dummy_tx = TxId(uuid::Uuid::nil());
-        let mut value = Vec::new();
-        value.extend_from_slice(&left.to_le_bytes());
-        value.extend_from_slice(&right.to_le_bytes());
+    // pub fn log_btree_new_root(&mut self, left: PageId, right: PageId) -> Result<()> {
+    //     let dummy_tx = TxId(uuid::Uuid::nil());
+    //     let mut value = Vec::new();
+    //     value.extend_from_slice(&left.to_le_bytes());
+    //     value.extend_from_slice(&right.to_le_bytes());
         
-        let record = WalRecord::Put {
-            tx: dummy_tx,
-            table_id: 4,
-            key: b"new_root".to_vec(),
-            value,
-        };
+    //     let record = WalRecord::Put {
+    //         tx: dummy_tx,
+    //         table_id: 4,
+    //         key: b"new_root".to_vec(),
+    //         value,
+    //     };
         
-        self.append(record)
-    }
+    //     self.append(record)
+    // }
 }
 
 
 // extra page implementations specific to BTree nodes
 impl Page {
 
+    // Converts raw page bytes to Node structure
      pub fn deserialize_btree(&self) -> Result<Node> {
         if self.header.page_type != PageType::BTreeLeaf && 
            self.header.page_type != PageType::BTreeInternal {
@@ -128,6 +239,7 @@ impl Page {
         if cursor + 2 > self.payload.len() {
             return Err(DbError::Corruption("Truncated BTree page".into()));
         }
+
         let key_count = u16::from_le_bytes(
             [self.payload[cursor], self.payload[cursor + 1]]
         );
@@ -261,6 +373,19 @@ impl Page {
         }
     }
     
+
+    /*
+        Memory Layout Example
+        Leaf Node Serialization:
+        [PageType] [KeyCount:u32] [ParentPresent:u8] [Parent:u64?] 
+        [NextPresent:u8] [Next:u64?] [(KeyLen:u16, Key:bytes, Value:u64)...]
+
+        Internal Node Serialization:
+        [PageType] [KeyCount:u32] [ParentPresent:u8] [Parent:u64?] 
+        [FirstChild:u64] [(KeyLen:u16, Key:bytes, Child:u64)...]
+     */
+
+    // Converts Node structure to raw page bytes
     pub fn serialize_btree(&mut self, node: &Node) -> Result<()> {
         // Clear payload
         self.payload.clear();
@@ -317,6 +442,8 @@ impl Page {
                 }
                 
                 // Write first child
+                // Internal nodes have n+1 children for n keys so first child is stored separately, then each subsequent child follows a key
+                // Child[0] | Key[0] | Child[1] | Key[1] | Child[2] | ... | Key[n-1] | Child[n]
                 self.payload.extend_from_slice(&internal.children[0].to_le_bytes());
                 
                 // Write keys and remaining children
@@ -338,6 +465,7 @@ impl Page {
         Ok(())
     }
     
+    //  A parent pointer tells a node which page contains its parent node in the tree hierarchy
     pub fn read_parent(&self) -> Option<PageId> {
         // Quick check: not a BTree page
         if self.header.page_type != PageType::BTreeLeaf && 
@@ -351,6 +479,7 @@ impl Page {
         
         // Skip key_count (2 bytes)
         if self.payload[2] != 0 && self.payload.len() >= 11 {
+            // read the parent details
             let parent_bytes: [u8; 8] = match self.payload[3..11].try_into() {
                 Ok(bytes) => bytes,
                 Err(_) => return None,
@@ -378,7 +507,7 @@ impl Page {
             self.payload.resize(11, 0);
         }
         
-        // Mark parent as present and write it
+        // Mark parent as present and write it into the parent position
         self.payload[2] = 1;
         self.payload[3..11].copy_from_slice(&parent.to_le_bytes());
         
@@ -386,19 +515,14 @@ impl Page {
     }
 }
 
-/* ============================================================
- * BTree
- * ============================================================
- */
 
+pub struct BTree {
+    root: PageId,
+    pages: PageFile,
+    wal: WalWriter,
+}
 
-    pub struct BTree {
-        root: PageId,
-        pages: PageFile,
-        wal: WalWriter,
-    }
-
-    impl BTree {
+impl BTree {
         
         pub fn new(mut pages: PageFile, wal: WalWriter) -> Result<Self> {
         let root = pages.allocate_page()?;
@@ -413,49 +537,45 @@ impl Page {
             values: vec![],
         };
 
+        // Write node details to disk
         write_node(&mut pages, root, &Node::Leaf(leaf))?;
         Ok(Self { root, pages, wal })
     }
 
-    /* ============================
-     * Search
-     * ============================
-     */
-
+    // PageId where data is stored for a given key.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<PageId>> {
         let mut current = self.root;
 
         loop {
+            // Read page from disk
             let node = read_node(&mut self.pages, current)?;
             match node {
                 Node::Leaf(leaf) => {
                     for (i, k) in leaf.keys.iter().enumerate() {
-                        if k.as_slice() == key {
+                        if k.as_slice() == key {  // Compare key bytes
+                            // Found - return PageId
                             return Ok(Some(leaf.values[i]));
                         }
                     }
                     return Ok(None);
                 }
                 Node::Internal(internal) => {
+                    // Find which child to follow based on key
                     let idx = find_child(&internal.keys, key);
+                    // change current cursor child page
                     current = internal.children[idx];
                 }
             }
         }
     }
 
-    /* ============================
-     * Range Scan
-     * ============================
-     */
-
     pub fn range(
         &mut self,
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<(Vec<u8>, PageId)>> {
-        let mut out = Vec::new();
-        let mut current = self.find_leaf(start)?;
+        let mut out = Vec::new(); // Results accumulator
+        let mut current = self.find_leaf(start)?; // Find first leaf containing 'start'
 
         loop {
             let leaf = match read_node(&mut self.pages, current)? {
@@ -464,12 +584,13 @@ impl Page {
             };
 
             for (k, v) in leaf.keys.iter().zip(leaf.values.iter()) {
-                // Use slice comparison instead of vector comparison
+                // Use slice comparison instead of vector comparison to check if its within range
                 if k.as_slice() >= start && k.as_slice() <= end {
                     out.push((k.clone(), *v));
                 }
             }
 
+            // Follow linked list to next leaf
             match leaf.next {
                 Some(next) => current = next,
                 None => break,
@@ -479,14 +600,9 @@ impl Page {
         Ok(out)
     }
 
-    /* ============================
-     * Insert
-     * ============================
-     */
+    pub fn insert(&mut self, key: Vec<u8>, value: PageId, tx_id: TxId) -> Result<()> {
 
-    pub fn insert(&mut self, key: Vec<u8>, value: PageId) -> Result<()> {
-        // Temporarily disable WAL logging to get it working
-        // self.wal.log_btree_insert(&key, value)?;
+        self.wal.log_btree_insert(&key, value, tx_id)?;
 
         let leaf_id = self.find_leaf(&key)?;
         let mut leaf = match read_node(&mut self.pages, leaf_id)? {
@@ -494,21 +610,29 @@ impl Page {
             _ => unreachable!(),
         };
 
+        // Insert key-value pair in sorted order
         insert_sorted(&mut leaf.keys, &mut leaf.values, key.clone(), value);
         leaf.header.key_count += 1;
 
+        // Check if leaf does not overflow
         if leaf.keys.len() <= MAX_KEYS {
+            // update leaf on disk
             write_node(&mut self.pages, leaf_id, &Node::Leaf(leaf))?;
             return Ok(());
         }
 
+        // it overflowed, need to split
         self.split_leaf(leaf_id, leaf)
     }
 
     fn split_leaf(&mut self, leaf_id: PageId, leaf: LeafNode) -> Result<()> {
-        self.wal.log_btree_split_leaf(leaf_id)?;
+        // no need to log internal operations like split
+        // self.wal.log_btree_split_leaf(leaf_id)?;
 
+        // Split point (middle)
         let mid = leaf.keys.len() / 2;
+
+        // allocate new leaf page
         let new_leaf_id = self.pages.allocate_page()?;
 
         let new_leaf = LeafNode {
@@ -528,6 +652,7 @@ impl Page {
         left.next = Some(new_leaf_id);
         left.header.key_count = mid as u16;
 
+        // write both leaf nodes to disk
         write_node(&mut self.pages, leaf_id, &Node::Leaf(left))?;
         write_node(&mut self.pages, new_leaf_id, &Node::Leaf(new_leaf.clone()))?;
 
@@ -535,15 +660,18 @@ impl Page {
         self.insert_into_parent(leaf_id, separator, new_leaf_id)
     }
 
+    // Parent with new child, handles parent splits.
     fn insert_into_parent(
         &mut self,
         left: PageId,
         key: Vec<u8>,
         right: PageId,
     ) -> Result<()> {
+        // Get parent of left child
         let parent_id = match parent_of(&mut self.pages, left)? {
             Some(p) => p,
             None => {
+                // No parent = create new root
                 return self.new_root(left, key, right);
             }
         };
@@ -553,32 +681,43 @@ impl Page {
             _ => unreachable!(),
         };
 
+        // Find insertion position
         let pos = find_child(&parent.keys, &key);
+        // Insert separator key
         parent.keys.insert(pos, key);
+        // Insert right child pointer
         parent.children.insert(pos + 1, right);
         parent.header.key_count += 1;
 
+        // check that parent does not overflow
         if parent.keys.len() <= MAX_KEYS {
             write_node(&mut self.pages, parent_id, &Node::Internal(parent))?;
             return Ok(());
         }
 
+        // if it does split!
         self.split_internal(parent_id, parent)
     }
 
 
+    // Overflowing internal node, promotes middle key.
     fn split_internal(
         &mut self,
         node_id: PageId,
         node: InternalNode,
     ) -> Result<()> {
-        // Temporarily disable WAL logging
+        // no need to log internal operations like split
         // self.wal.log_btree_split_internal(node_id)?;
 
+         // Split point (middle)
         let mid = node.keys.len() / 2;
+        // Key to promote to parent - the middle key
         let promote = node.keys[mid].clone();
 
+        // New internal node
         let right_id = self.pages.allocate_page()?;
+
+        // create right half
         let right = InternalNode {
             header: NodeHeader {
                 is_leaf: false,
@@ -589,34 +728,40 @@ impl Page {
             children: node.children[mid + 1..].to_vec(),
         };
 
+        // previous not becomes left here
         let mut left = node;
         left.keys.truncate(mid);
         left.children.truncate(mid + 1);
         left.header.key_count = mid as u16;
-
+        // write both internal nodes to disk
         write_node(&mut self.pages, node_id, &Node::Internal(left))?;
         write_node(&mut self.pages, right_id, &Node::Internal(right))?;
 
         self.insert_into_parent(node_id, promote, right_id)
     }
 
+    // New root when tree grows in height.
     fn new_root(
         &mut self,
         left: PageId,
         key: Vec<u8>,
         right: PageId,
     ) -> Result<()> {
-        // Temporarily disable WAL logging
+        // no need to log internal operations like split
         // self.wal.log_btree_new_root(left, right)?;
 
-        let root_id = self.pages.allocate_page()?;
+        let root_id = self.pages.allocate_page()?; // New root page
+
+        // Create root internal node
         let root = InternalNode {
             header: NodeHeader {
                 is_leaf: false,
                 key_count: 1,
-                parent: None,
+                parent: None, // Root has no parent
             },
+            // Single separator key
             keys: vec![key],
+            // Point to two children
             children: vec![left, right],
         };
 
@@ -643,11 +788,6 @@ impl Page {
     }
 }
 
-/* ============================================================
- * Helpers
- * ============================================================
- */
-
 fn find_child(keys: &[Vec<u8>], key: &[u8]) -> usize {
     keys.iter()
         .position(|k| key < k.as_slice())
@@ -664,11 +804,6 @@ fn insert_sorted(
     keys.insert(pos, key);
     values.insert(pos, value);
 }
-
-/* ============================================================
- * Page Serialization Hooks
- * ============================================================
- */
 
 fn read_node(pages: &mut PageFile, id: PageId) -> Result<Node> {
     let page = pages.read_page(id)?;
