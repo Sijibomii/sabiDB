@@ -519,7 +519,7 @@ impl Page {
 pub struct BTree {
     root: PageId,
     pages: PageFile,
-    wal: WalWriter,
+    pub wal: WalWriter,
 }
 
 impl BTree {

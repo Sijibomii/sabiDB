@@ -64,3 +64,13 @@ CREATE INDEX idx_users_name ON users(name);
 CREATE INDEX idx_users_email_domain ON users(email, domain);
 
 -- BTree key: b"users:email:alice@company.com:domain:company.com"
+
+
+
+-------------------------------------------------------------------
+
+Layer	Responsibility
+MVCC	Which row version is visible
+B+Tree	Where row versions live on disk
+PageFile	Physical persistence
+WAL	Deterministic replay

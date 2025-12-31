@@ -54,7 +54,7 @@ Versions: [
  * ========================= */
 #[derive(Debug)]
 pub struct MvccTable {
-    rows: BTreeMap<Vec<u8>, VersionChain>, 
+    pub rows: BTreeMap<Vec<u8>, VersionChain>, 
 }
 
 impl MvccTable {
@@ -228,7 +228,7 @@ impl TransactionManager {
 
 
 #[inline]
-fn is_visible(v: &RowVersion, tx: &Transaction) -> bool {
+pub fn is_visible(v: &RowVersion, tx: &Transaction) -> bool {
     v.created_by <= tx.snapshot_tx
         && v.deleted_by.map_or(true, |d| d > tx.snapshot_tx)
 }

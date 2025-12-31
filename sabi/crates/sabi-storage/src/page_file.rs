@@ -21,14 +21,25 @@ page_file.free_page(page_id);
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use sabi_core::error::{Result};
 
 use crate::page::{Page, PAGE_SIZE};
 
+
 pub struct PageFile {
-    file: File, // OS file handle
+    file: Arc<RwLock<File>>, // OS file handle
     free_list: Vec<u64>, // Reusable page IDs
+}
+
+impl Clone for PageFile {
+    fn clone(&self) -> Self {
+        Self {
+            file: Arc::clone(&self.file),
+            free_list: self.free_list.clone(),
+        }
+    }
 }
 
 impl PageFile {
@@ -40,7 +51,7 @@ impl PageFile {
             .open(path)?;
 
         Ok(Self {
-            file,
+            file: Arc::new(RwLock::new(file)),
             free_list: Vec::new(),
         })
     }
@@ -49,14 +60,16 @@ impl PageFile {
         // calculate starting position for page
         let offset = page_id * PAGE_SIZE as u64;
 
+        let mut file = self.file.write().unwrap();
+
         // move cursor to page start
-        self.file.seek(SeekFrom::Start(offset))?;
+        file.seek(SeekFrom::Start(offset))?;
 
         // Buffer for raw page
         let mut buf = [0u8; PAGE_SIZE];
 
         // Read exactly 4096 bytes
-        self.file.read_exact(&mut buf)?;
+        file.read_exact(&mut buf)?;
 
         Page::deserialize(&buf)
     }
@@ -65,14 +78,16 @@ impl PageFile {
         // calculate starting position for page
         let offset = page.header.page_id * PAGE_SIZE as u64;
 
+        let mut file = self.file.write().unwrap();
+
         // move cursor to page start
-        self.file.seek(SeekFrom::Start(offset))?;
+        file.seek(SeekFrom::Start(offset))?;
 
         let buf = page.serialize()?;
         // Write to file
-        self.file.write_all(&buf)?;
+        file.write_all(&buf)?;
         // Flush to disk
-        self.file.sync_data()?;
+        file.sync_data()?;
 
         Ok(())
     }
@@ -83,7 +98,8 @@ impl PageFile {
             Ok(id)
         } else {
             // Otherwise, allocate at end of file
-            let len = self.file.metadata()?.len();
+            let file = self.file.write().unwrap();
+            let len = file.metadata()?.len();
             // calculate number of pages (id of new page)
             Ok(len / PAGE_SIZE as u64)
         }

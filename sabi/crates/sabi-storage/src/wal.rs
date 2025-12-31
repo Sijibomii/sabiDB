@@ -51,8 +51,9 @@ Returning only committed operations for replay
 
 use std::collections::{HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read,Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 use crc32fast::Hasher;
 
@@ -120,7 +121,35 @@ pub enum WalRecord {
 }
 
 pub struct WalWriter {
-    file: File,
+    file: Arc<RwLock<File>>,
+}
+
+impl Clone for WalWriter {
+    fn clone(&self) -> Self {
+        Self{file: Arc::clone(&self.file)}
+    }
+}
+
+impl WalWriter {
+    pub fn flush(&self) -> io::Result<()> {
+        let mut file = self.file.write().unwrap();
+        file.flush()
+    }
+    
+    pub fn write_all(&self, buf: &[u8]) -> io::Result<()> {
+        let mut file = self.file.write().unwrap();
+        file.write_all(buf)
+    }
+    
+    pub fn sync_all(&self) -> io::Result<()> {
+        let file = self.file.write().unwrap();
+        file.sync_all()
+    }
+    
+    pub fn sync_data(&self) -> io::Result<()> {
+        let file = self.file.write().unwrap();
+        file.sync_data()
+    }
 }
 
 impl WalWriter {
@@ -140,7 +169,7 @@ impl WalWriter {
             file.sync_all()?;
         }
 
-        Ok(Self { file })
+        Ok(Self { file: Arc::new(RwLock::new(file)) })
     }
 
     /// Append a WAL record.
@@ -158,11 +187,13 @@ impl WalWriter {
         let checksum = hasher.finalize();
 
         let len = payload.len() as u32;
+
+        let mut file = self.file.write().unwrap();
         
         // write details to the file
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(&payload)?;
-        self.file.write_all(&checksum.to_le_bytes())?;
+        file.write_all(&len.to_le_bytes())?;
+        file.write_all(&payload)?;
+        file.write_all(&checksum.to_le_bytes())?;
 
         // fsync boundary:
         // durability guarantee at COMMIT
@@ -182,7 +213,7 @@ impl WalWriter {
             wal.append(WalRecord::Update { id: <uuid>, data: b"updated" })?;
             // Crash here = transaction 2 lost (but 1 persists)
              */
-            self.file.sync_data()?;
+            file.sync_data()?;
         }
 
         Ok(())
