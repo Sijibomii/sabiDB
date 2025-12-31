@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+sabi-core = { path = "../sabi-core" }
+sabi-storage = { path = "../sabi-storage" }
+
+sqlparser = "0.60.0"
+thiserror = "2.0.17"
+serde = { version = "1.0", features = ["derive"] }
+regex = "1.10"
+rustyline = "14.0"
+
+[dev-dependencies]
+tempfile = "3.10"
