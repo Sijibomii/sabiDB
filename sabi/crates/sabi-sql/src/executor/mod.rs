@@ -5,7 +5,7 @@ use sabi_core::TxId;
 use sabi_storage::engine::{StorageEngine};
 use sabi_storage::mvcc::Transaction;
 
-use crate::parser::{BinaryOperator, Expr, UnaryOperator};
+use crate::parser::{self, BinaryOperator, Expr, QueryParser, UnaryOperator};
 use crate::planner::{LogicalPlan, Catalog};
 use crate::types::{DataType, TableSchema, Value};
 use crate::error::SqlError;
@@ -37,7 +37,7 @@ impl QueryExecutor {
     pub fn new(storage: Arc<Mutex<StorageEngine>>, catalog: Catalog) -> Self {
         Self {
             storage,
-            catalog,
+            catalog, 
             current_transaction: None,
             auto_commit: true,
         }
@@ -46,6 +46,7 @@ impl QueryExecutor {
     /// Execute a logical plan
     pub fn execute(&mut self, plan: LogicalPlan) -> Result<QueryResult, SqlError> {
         match plan {
+
             LogicalPlan::CreateTable { schema, if_not_exists } => {
                 self.execute_create_table(schema, if_not_exists)
             }

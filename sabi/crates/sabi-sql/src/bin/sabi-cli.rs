@@ -7,8 +7,12 @@ use std::io::{self, Write};
 use rustyline::{Editor, error::ReadlineError};
 use rustyline::history::DefaultHistory;
 
-use sabi_storage::{PageFile, WalWriter, StorageEngine};
-use sabi_sql::{QueryParser, QueryPlanner, QueryExecutor, Catalog};
+use sabi_storage::page_file::PageFile;
+use sabi_storage::engine::{StorageEngine};
+use sabi_storage::wal::WalWriter;
+
+use sabi_sql::parser::QueryParser;
+use sabi_sql::planner::{QueryPlanner, Catalog};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("SabiDB - A Simple MVCC Database");
@@ -17,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Initialize storage
     let pages = PageFile::open("sabidb.data")?;
-    let wal = WalWriter::new("sabidb.wal")?;
+    let wal = WalWriter::open("sabidb.wal")?;
     let storage = Arc::new(Mutex::new(StorageEngine::new(pages, wal)?));
     
     // Initialize SQL components

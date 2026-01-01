@@ -1,4 +1,4 @@
-mod ast;
+pub mod ast;
 
 use sqlparser::{dialect::GenericDialect, parser::Parser};
 use crate::types::{ColumnDef, DataType, Value};

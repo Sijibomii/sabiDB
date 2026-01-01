@@ -1,5 +1,5 @@
 mod error;
 mod types;
-mod parser;
-mod planner;
+pub mod parser;
+pub mod planner;
 mod executor;

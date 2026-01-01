@@ -1,5 +1,5 @@
 use crate::parser::ast::*;
-use crate::types::{TableSchema, ColumnDef};
+use crate::types::{TableSchema, Value};
 use crate::error::SqlError;
 
 /// Logical query plan nodes
@@ -63,7 +63,7 @@ pub enum LogicalPlan {
 /// Query planner - converts AST to logical plan
 pub struct QueryPlanner {
     /// Catalog of tables and schemas
-    catalog: Catalog,
+    pub catalog: Catalog,
 }
 
 /// Simple catalog for table metadata
@@ -188,7 +188,7 @@ impl QueryPlanner {
         let mut plan = LogicalPlan::Scan {
             table_name,
             columns: columns.clone(),
-            filter: stmt.where_clause,
+            filter: stmt.where_clause.clone(),
             schema: schema.clone(),
         };
         
