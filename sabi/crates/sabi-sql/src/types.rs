@@ -1,6 +1,8 @@
 use std::fmt;
 use serde::{Serialize, Deserialize};
 
+use crate::error::SqlError;
+
 /// Supported SQL data types
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -21,7 +23,7 @@ impl fmt::Display for DataType {
 }
 
 /// Runtime values
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Integer(i64),
@@ -31,6 +33,34 @@ pub enum Value {
 }
 
 impl Value {
+
+    pub fn compare(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+            (Value::Null, _) | (_, Value::Null) => None, // NULL is not comparable
+            (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+            (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+            _ => None, 
+        }
+    }
+    
+    pub fn lt(&self, other: &Value) -> bool {
+        self.compare(other).map(|ord| ord == std::cmp::Ordering::Less).unwrap_or(false)
+    }
+    
+    pub fn le(&self, other: &Value) -> bool {
+        self.compare(other).map(|ord| ord != std::cmp::Ordering::Greater).unwrap_or(false)
+    }
+    
+    pub fn gt(&self, other: &Value) -> bool {
+        self.compare(other).map(|ord| ord == std::cmp::Ordering::Greater).unwrap_or(false)
+    }
+    
+    pub fn ge(&self, other: &Value) -> bool {
+        self.compare(other).map(|ord| ord != std::cmp::Ordering::Less).unwrap_or(false)
+    }
+
     pub fn data_type(&self) -> Option<DataType> {
         match self {
             Value::Null => None,

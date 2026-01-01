@@ -1,7 +1,7 @@
 mod ast;
 
 use sqlparser::{dialect::GenericDialect, parser::Parser};
-use crate::types::{ColumnDef, DataType};
+use crate::types::{ColumnDef, DataType, Value};
 pub use ast::*;
 use crate::error::SqlError;
 
@@ -37,41 +37,62 @@ impl QueryParser {
     
     /// Convert sqlparser AST to our internal AST
     fn convert_statement(&self, stmt: sqlparser::ast::Statement) -> Result<Statement, SqlError> {
-        match stmt {
-            sqlparser::ast::Statement::CreateTable(create_table) => {
-                Ok(Statement::CreateTable(self.parse_create_table(
-                    create_table.name,
-                    create_table.columns,
-                )?))
-            }
-            
-            sqlparser::ast::Statement::Insert(insert_stmt) =>  {
-                Ok(Statement::Insert(self.parse_insert(insert_stmt.table, insert_stmt.columns, *insert_stmt.source)?))
-            }
-            
-            sqlparser::ast::Statement::Query(query) => {
-                Ok(Statement::Select(self.parse_select(*query)?))
-            }
-            
-            sqlparser::ast::Statement::Delete(delete_stmt)=> {
-                Ok(Statement::Delete(self.parse_delete(delete_stmt.tables, delete_stmt.selection)?))
-            }
-            
-            sqlparser::ast::Statement::StartTransaction { .. } => {
-                Ok(Statement::BeginTransaction)
-            }
-            
-            sqlparser::ast::Statement::Commit { .. } => {
-                Ok(Statement::Commit)
-            }
-            
-            sqlparser::ast::Statement::Rollback { .. } => {
-                Ok(Statement::Rollback)
-            }
-            
-            _ => Err(SqlError::ParseError(format!("Unsupported statement: {:?}", stmt))),
+    match stmt {
+        sqlparser::ast::Statement::CreateTable(create_table) => {
+            Ok(Statement::CreateTable(self.parse_create_table(
+                create_table.name,
+                create_table.columns,
+            )?))
         }
+        
+        sqlparser::ast::Statement::Insert(insert_stmt) =>  {
+            // Extract table name from TableObject enum
+            let table_name = match insert_stmt.table {
+                sqlparser::ast::TableObject::TableName(name) => name,
+                sqlparser::ast::TableObject::TableFunction(_) => {
+                    return Err(SqlError::ParseError(
+                        "INSERT INTO table functions not supported".into()
+                    ));
+                }
+            };
+            
+            Ok(Statement::Insert(self.parse_insert(
+                table_name,
+                insert_stmt.columns, 
+                *insert_stmt.source.unwrap()
+            )?))
+        }
+        
+        sqlparser::ast::Statement::Query(query) => {
+            Ok(Statement::Select(self.parse_select(*query)?))
+        }
+        
+        sqlparser::ast::Statement::Delete(delete_stmt) => {
+            // Delete can have multiple tables, handle them
+            // For simplicity, we'll use the first table
+
+            // Get the first table (main table to delete from)
+            let table = delete_stmt.tables.first()
+                .ok_or_else(|| SqlError::ParseError("No table specified in DELETE statement".into()))?;
+            
+            Ok(Statement::Delete(self.parse_delete(table.clone(), delete_stmt.selection)?))
+        }
+        
+        sqlparser::ast::Statement::StartTransaction { .. } => {
+            Ok(Statement::BeginTransaction)
+        }
+        
+        sqlparser::ast::Statement::Commit { .. } => {
+            Ok(Statement::Commit)
+        }
+        
+        sqlparser::ast::Statement::Rollback { .. } => {
+            Ok(Statement::Rollback)
+        }
+        
+        _ => Err(SqlError::ParseError(format!("Unsupported statement: {:?}", stmt))),
     }
+}
     
     fn parse_create_table(
         &self,
@@ -88,10 +109,10 @@ impl QueryParser {
             });
             
             let primary_key = col.options.iter().any(|opt| {
-                matches!(opt.option, sqlparser::ast::ColumnOption::Unique(sqlparser::ast::Unique { is_primary: true }))
+                matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_))
             });
             
-            column_defs.push(ColumnDef {
+            column_defs.push(crate::types::ColumnDef {
                 name: col.name.value,
                 data_type,
                 nullable,
@@ -143,6 +164,7 @@ impl QueryParser {
         })
     }
     
+
     fn parse_select(&self, query: sqlparser::ast::Query) -> Result<SelectStmt, SqlError> {
         let body = *query.body;
         let select = match body {
@@ -185,19 +207,55 @@ impl QueryParser {
         
         // Parse ORDER BY
         let mut order_by = Vec::new();
-        for expr in query.order_by {
-            order_by.push(OrderByExpr {
-                expr: self.convert_expr(expr.expr)?,
-                asc: !expr.asc.unwrap_or(true),
-            });
+        
+        for order in query.order_by {
+            match order.kind {
+                sqlparser::ast::OrderByKind::Expressions(exprs) => {
+                    for expr in exprs {
+                        order_by.push(OrderByExpr {
+                            expr: self.convert_expr(expr.expr)?,
+                            asc: expr.options.asc.unwrap_or(true), // true = ASC, false = DESC
+                        });
+                    }
+                }
+                _ => return Err(SqlError::ParseError("Unsupported ORDER BY kind".into())),
+            }
         }
         
         // Parse LIMIT/OFFSET
-        let limit = query.limit.map(|expr| self.convert_expr(expr)).transpose()?;
-        let offset = query.offset.map(|(_, expr)| self.convert_expr(expr)).transpose()?;
-        
+        let (limit, offset) = match query.limit_clause {
+            Some(limit_clause) => match limit_clause {
+                sqlparser::ast::LimitClause::LimitOffset {
+                    limit,
+                    offset,
+                    limit_by: _,
+                } => {
+                    let limit = limit
+                        .map(|e| self.convert_expr(e))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            SqlError::ParseError("LIMIT must have a value".into())
+                        })?;
+
+                    let offset = offset
+                        .map(|e| self.convert_expr(e.value))
+                        .transpose()?;
+
+                    (Some(limit), offset)
+                }
+
+                sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+                    let limit = self.convert_expr(limit)?;
+                    let offset = self.convert_expr(offset)?;
+                    (Some(limit), Some(offset))
+                }
+            },
+            None => (None, None)
+        };
+
+
         Ok(SelectStmt {
-            distinct: select.distinct,
+            distinct: select.distinct.is_some(),
             columns,
             from,
             where_clause,
@@ -206,7 +264,7 @@ impl QueryParser {
             offset,
         })
     }
-    
+        
     fn parse_delete(
         &self,
         table_name: sqlparser::ast::ObjectName,
@@ -234,8 +292,8 @@ impl QueryParser {
     
     fn convert_expr(&self, expr: sqlparser::ast::Expr) -> Result<Expr, SqlError> {
         match expr {
-            sqlparser::ast::Expr::Value(value) => {
-                let val = match value {
+            sqlparser::ast::Expr::Value(value_with_span) => {
+                let val = match value_with_span.value {
                     sqlparser::ast::Value::Number(s, _) => {
                         Value::Integer(s.parse().map_err(|e| {
                             SqlError::ParseError(format!("Invalid number: {}", e))
@@ -267,7 +325,7 @@ impl QueryParser {
                     sqlparser::ast::BinaryOperator::Minus => BinaryOperator::Sub,
                     sqlparser::ast::BinaryOperator::Multiply => BinaryOperator::Mul,
                     sqlparser::ast::BinaryOperator::Divide => BinaryOperator::Div,
-                    sqlparser::ast::BinaryOperator::Like => BinaryOperator::Like,
+                    // sqlparser::ast::BinaryOperator::Like => BinaryOperator::Like,
                     _ => return Err(SqlError::ParseError("Unsupported binary operator".into())),
                 };
                 
@@ -342,11 +400,30 @@ impl QueryParser {
         }
     }
     
-    fn object_name_to_string(&self, name: sqlparser::ast::ObjectName) -> Result<String, SqlError> {
-        let parts: Vec<String> = name.0.into_iter().map(|ident| ident.value).collect();
+    fn object_name_to_string(
+        &self,
+        name: sqlparser::ast::ObjectName,
+    ) -> Result<String, SqlError> {
+        let parts: Vec<String> = name
+            .0
+            .into_iter()
+            .map(|part| match part {
+                sqlparser::ast::ObjectNamePart::Identifier(ident) => Ok(ident.value),
+                _ => {
+                    return Err(SqlError::ParseError(
+                        "Unsupported object name part".into(),
+                    ))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+
         if parts.len() != 1 {
-            return Err(SqlError::ParseError("Only simple table names supported".into()));
+            return Err(SqlError::ParseError(
+                "Only simple table names supported".into(),
+            ));
         }
+
         Ok(parts[0].clone())
     }
+
 }

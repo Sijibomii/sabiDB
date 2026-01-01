@@ -1,6 +1,8 @@
 //! Abstract Syntax Tree for SQL queries
 
-use crate::types::{DataType, Value};
+// use sqlparser::ast::ColumnDef;
+
+use crate::types::{ColumnDef, Value};
 
 /// SQL statement types
 #[derive(Debug, Clone)]

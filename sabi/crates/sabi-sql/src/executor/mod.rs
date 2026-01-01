@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use sabi_core::TxId;
-use sabi_storage::{StorageEngine, Transaction};
+use sabi_storage::engine::{StorageEngine};
+use sabi_storage::mvcc::Transaction;
 
+use crate::parser::{BinaryOperator, Expr, UnaryOperator};
 use crate::planner::{LogicalPlan, Catalog};
-use crate::types::{Value, TableSchema};
+use crate::types::{DataType, TableSchema, Value};
 use crate::error::SqlError;
 
 /// Query execution result
@@ -82,7 +84,7 @@ impl QueryExecutor {
         }
         
         // Create table in storage
-        storage.tables.insert(schema.name.clone(), sabi_storage::MvccTable::new());
+        storage.tables.insert(schema.name.clone(), sabi_storage::mvcc::MvccTable::new());
         
         // Add to catalog
         self.catalog.add_table(schema);
@@ -144,13 +146,13 @@ impl QueryExecutor {
         let all_rows = storage.range_scan(&table_name, &[], &[], &tx)
             .map_err(|e| SqlError::Storage(e))?;
         
-        for (key, value_bytes) in all_rows {
+        for (_, value_bytes) in all_rows {
             // Deserialize row
             let row = self.deserialize_row(&schema, &value_bytes)?;
             
             // Filter columns
             let selected_row: Vec<Value> = if columns.is_empty() {
-                row.values().cloned().collect()
+                row.iter().cloned().collect()
             } else {
                 columns.iter()
                     .filter_map(|col| schema.columns.iter()
@@ -283,7 +285,7 @@ impl QueryExecutor {
         let tx = self.current_transaction.take()
             .ok_or_else(|| SqlError::ExecutionError("No transaction to commit".into()))?;
         
-        let mut storage = self.storage.lock().unwrap();
+        let storage = self.storage.lock().unwrap();
         storage.commit(tx.tx_id)
             .map_err(|e| SqlError::Storage(e))?;
         
@@ -295,7 +297,7 @@ impl QueryExecutor {
         let tx = self.current_transaction.take()
             .ok_or_else(|| SqlError::ExecutionError("No transaction to rollback".into()))?;
         
-        let mut storage = self.storage.lock().unwrap();
+        let storage = self.storage.lock().unwrap();
         storage.abort(tx.tx_id)
             .map_err(|e| SqlError::Storage(e))?;
         
@@ -373,14 +375,18 @@ impl QueryExecutor {
         let mut row_data = Vec::new();
         
         // If columns specified, use that order; otherwise use schema order
-        let col_names = columns.as_ref().map(|cols| cols.as_slice())
-            .unwrap_or(&schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
+        let col_names: Vec<&String> = if let Some(cols) = columns {
+            cols.iter().collect()
+        } else {
+            schema.columns.iter().map(|c| &c.name).collect()
+        };
         
         for (i, col_name) in col_names.iter().enumerate() {
             // Find column in schema
+    
             let col = schema.columns.iter()
-                .find(|c| &c.name == col_name)
-                .ok_or_else(|| SqlError::ColumnNotFound((*col_name).clone()))?;
+                .find(|c| &c.name == *col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.to_string()))?;
             
             // Evaluate value
             let value = self.evaluate_expression(&values[i], &HashMap::new())?;
@@ -594,23 +600,24 @@ impl QueryExecutor {
         }
     }
     
-    fn compare_values<F>(
-        &self,
-        left: &Value,
-        right: &Value,
-        comparator: F,
-    ) -> Result<Value, SqlError>
-    where
-        F: FnOnce(&Value, &Value) -> bool,
+    fn compare_values<F>(&self, left: &Value, right: &Value, comparator: F) -> Result<Value, SqlError>
+        where
+            F: Fn(&Value, &Value) -> bool,
     {
+        // Check if values are comparable
         match (left, right) {
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Boolean(false)),
-            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Boolean(comparator(a, b))),
-            (Value::Text(a), Value::Text(b)) => Ok(Value::Boolean(comparator(a, b))),
-            (Value::Boolean(a), Value::Boolean(b)) => Ok(Value::Boolean(comparator(a, b))),
+            (Value::Null, _) | (_, Value::Null) => {
+                // In SQL, NULL compared with anything returns NULL (not false)
+                Ok(Value::Null)
+            }
+            (Value::Integer(_), Value::Integer(_)) |
+            (Value::Text(_), Value::Text(_)) |
+            (Value::Boolean(_), Value::Boolean(_)) => {
+                Ok(Value::Boolean(comparator(left, right)))
+            }
             _ => Err(SqlError::TypeError {
-                expected: left.data_type().map(|t| t.to_string()).unwrap_or("NULL".into()),
-                actual: right.data_type().map(|t| t.to_string()).unwrap_or("NULL".into()),
+                expected: format!("Values of comparable types"),
+                actual: format!("{:?} and {:?}", left.data_type(), right.data_type()),
             }),
         }
     }
