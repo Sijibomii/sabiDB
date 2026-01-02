@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::io::{self, Write};
 
 use rustyline::{Editor, error::ReadlineError};
 use rustyline::history::DefaultHistory;
@@ -13,6 +12,7 @@ use sabi_storage::wal::WalWriter;
 
 use sabi_sql::parser::QueryParser;
 use sabi_sql::planner::{QueryPlanner, Catalog};
+use sabi_sql::executor::QueryExecutor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("SabiDB - A Simple MVCC Database");
@@ -92,19 +92,19 @@ fn execute_query(
         match executor.execute(plan) {
             Ok(result) => {
                 match result {
-                    sabi_sql::QueryResult::CreateTable => {
+                    sabi_sql::executor::QueryResult::CreateTable => {
                         println!("Table created");
                     }
-                    sabi_sql::QueryResult::Insert(count) => {
+                    sabi_sql::executor::QueryResult::Insert(count) => {
                         println!("Inserted {} row(s)", count);
                     }
-                    sabi_sql::QueryResult::Select { columns, rows } => {
+                    sabi_sql::executor::QueryResult::Select { columns, rows } => {
                         // Print header
                         println!("{}", columns.join(" | "));
                         println!("{}", "-".repeat(columns.join(" | ").len()));
                         
                         // Print rows
-                        for row in rows {
+                        for row in rows.clone() {
                             let formatted: Vec<String> = row.iter()
                                 .map(|v| v.to_string())
                                 .collect();
@@ -112,16 +112,16 @@ fn execute_query(
                         }
                         println!("{} row(s) returned", rows.len());
                     }
-                    sabi_sql::QueryResult::Delete(count) => {
+                    sabi_sql::executor::QueryResult::Delete(count) => {
                         println!("Deleted {} row(s)", count);
                     }
-                    sabi_sql::QueryResult::BeginTransaction(tx_id) => {
+                    sabi_sql::executor::QueryResult::BeginTransaction(tx_id) => {
                         println!("Transaction started: {}", tx_id);
                     }
-                    sabi_sql::QueryResult::Commit => {
+                    sabi_sql::executor::QueryResult::Commit => {
                         println!("Transaction committed");
                     }
-                    sabi_sql::QueryResult::Rollback => {
+                    sabi_sql::executor::QueryResult::Rollback => {
                         println!("Transaction rolled back");
                     }
                 }

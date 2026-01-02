@@ -67,6 +67,7 @@ pub struct QueryPlanner {
 }
 
 /// Simple catalog for table metadata
+#[derive(Clone)]
 pub struct Catalog {
     tables: std::collections::HashMap<String, TableSchema>,
 }
