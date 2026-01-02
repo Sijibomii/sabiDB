@@ -424,6 +424,14 @@ dependencies = [
 [[package]]
 name = "sabi-runtime"
 version = "0.1.0"
+dependencies = [
+ "sabi-core",
+ "sabi-sql",
+ "sabi-storage",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "sabi-server"
