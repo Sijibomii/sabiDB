@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/sabi-core", "crates/sabi-server", "crates/sabi-sql", "crates/sabi-storage",
+    "crates/sabi-core", "crates/sabi-runtime", "crates/sabi-server", "crates/sabi-sql", "crates/sabi-storage",
 ]
 
 resolver = "2"
