@@ -53,6 +53,7 @@ impl Page {
         let mut buf = [0u8; PAGE_SIZE];
 
         // Write header fields
+        let payload_length = self.payload.len() as u32;
 
         // page magic
         buf[0..4].copy_from_slice(PAGE_MAGIC);
@@ -70,7 +71,7 @@ impl Page {
         buf[16..24].copy_from_slice(&self.header.lsn.to_le_bytes());
 
         // payload length
-        buf[24..28].copy_from_slice(&self.header.payload_len.to_le_bytes());
+        buf[24..28].copy_from_slice(&payload_length.to_le_bytes());
 
         let payload_start = 32; // header size is 32 bytes
         let payload_end = payload_start + self.payload.len();
@@ -122,6 +123,7 @@ impl Page {
 
         // if checksum does not match, return error
         if actual_checksum != expected_checksum {
+            print!("Page checksum mismatch: actual={:?}, expected={:?} \n", actual_checksum, expected_checksum);
             return Err(DbError::Corruption("Page checksum mismatch".into()));
         }
 

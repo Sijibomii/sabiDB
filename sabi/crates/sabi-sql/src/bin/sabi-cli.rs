@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize SQL components
     let parser = QueryParser::new();
     let catalog = Catalog::new();
-    let planner = QueryPlanner::new(catalog);
+    let mut planner = QueryPlanner::new(catalog);
     let mut executor = QueryExecutor::new(storage.clone(), planner.catalog.clone());
     
     // Setup readline with history
@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match trimmed.to_lowercase().as_str() {
                     "exit" | "quit" => break,
                     "help" => print_help(),
-                    _ => execute_query(trimmed, &parser, &planner, &mut executor)?,
+                    _ => execute_query(trimmed, &parser, &mut planner, &mut executor)?,
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -76,12 +76,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn execute_query(
     sql: &str,
     parser: &QueryParser,
-    planner: &QueryPlanner,
+    planner: &mut QueryPlanner,
     executor: &mut QueryExecutor,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Parse SQL
     let statements = parser.parse(sql)
         .map_err(|e| format!("Parse error: {}", e))?;
+
+    print!("statements generated: {:?}", statements); 
     
     for stmt in statements {
         // Plan statement

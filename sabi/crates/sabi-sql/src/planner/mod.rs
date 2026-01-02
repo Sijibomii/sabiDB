@@ -98,7 +98,7 @@ impl QueryPlanner {
     }
     
     /// Plan a single statement
-    pub fn plan(&self, stmt: Statement) -> Result<LogicalPlan, SqlError> {
+    pub fn plan(&mut self, stmt: Statement) -> Result<LogicalPlan, SqlError> {
         match stmt {
             Statement::CreateTable(create) => self.plan_create_table(create),
             Statement::Insert(insert) => self.plan_insert(insert),
@@ -110,7 +110,7 @@ impl QueryPlanner {
         }
     }
     
-    fn plan_create_table(&self, stmt: CreateTableStmt) -> Result<LogicalPlan, SqlError> {
+    fn plan_create_table(&mut self, stmt: CreateTableStmt) -> Result<LogicalPlan, SqlError> {
         // Check if table already exists
         if !stmt.if_not_exists && self.catalog.table_exists(&stmt.table_name) {
             return Err(SqlError::PlannerError(format!(
@@ -127,13 +127,15 @@ impl QueryPlanner {
                 .collect::<Vec<_>>()
                 .into(),
         };
+
+        self.catalog.add_table(schema.clone());
         
         Ok(LogicalPlan::CreateTable {
             schema,
             if_not_exists: stmt.if_not_exists,
         })
     }
-    
+     
     fn plan_insert(&self, stmt: InsertStmt) -> Result<LogicalPlan, SqlError> {
         // Get table schema
         let schema = self.catalog.get_table(&stmt.table_name)

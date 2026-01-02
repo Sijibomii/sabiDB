@@ -28,8 +28,8 @@ pub enum QueryResult {
 /// Query executor - executes logical plans against storage
 pub struct QueryExecutor {
     storage: Arc<Mutex<StorageEngine>>,
-    catalog: Catalog,
-    current_transaction: Option<Transaction>,
+    catalog: Catalog, // Database schema/metadata
+    current_transaction: Option<Transaction>, // Active transaction
     auto_commit: bool,
 }
 
@@ -88,7 +88,13 @@ impl QueryExecutor {
         storage.tables.insert(schema.name.clone(), sabi_storage::mvcc::MvccTable::new());
         
         // Add to catalog
-        self.catalog.add_table(schema);
+
+        print!("schema: {:?}", schema); 
+
+        // executer adds to catalog
+        self.catalog.add_table(schema.clone());
+
+        print!("catalog: {:?}", self.catalog.get_table(&schema.name)); 
         
         Ok(QueryResult::CreateTable)
     }
@@ -102,15 +108,21 @@ impl QueryExecutor {
     ) -> Result<QueryResult, SqlError> {
         let tx = self.begin_transaction()?;
         let mut storage = self.storage.lock().unwrap();
+
+        print!("table name: {:?}", table_name); 
         
         let mut rows_inserted = 0;
         
         for row_values in values {
             // Build key from primary key columns
             let key = self.build_row_key(&schema, &columns, &row_values)?;
+
+            print!("row key generated: {:?}", key); 
             
             // Serialize row
             let row_data = self.serialize_row(&schema, &columns, row_values)?;
+
+            print!("row data generated: {:?}", row_data); 
             
             // Insert into storage
             storage.insert(&table_name, key, row_data, &tx)
@@ -324,11 +336,14 @@ impl QueryExecutor {
         values: &[Expr],
     ) -> Result<Vec<u8>, SqlError> {
         // Use primary key columns for key
+        // get the primary key column - there can be more than one in a table
         if let Some(ref pk_cols) = schema.primary_key {
+            
             let mut key_parts = Vec::new();
             
             for pk_col in pk_cols {
                 let idx = if let Some(cols) = columns {
+                    // find the column position
                     cols.iter().position(|c| c == pk_col)
                         .ok_or_else(|| SqlError::ColumnNotFound(pk_col.clone()))?
                 } else {
@@ -337,6 +352,7 @@ impl QueryExecutor {
                         .ok_or_else(|| SqlError::ColumnNotFound(pk_col.clone()))?
                 };
                 
+                // if the location where the primary key is expected to be is more than the number of values - primary key is missing
                 if idx >= values.len() {
                     return Err(SqlError::ExecutionError(
                         format!("Primary key column '{}' not provided", pk_col)
@@ -345,6 +361,7 @@ impl QueryExecutor {
                 
                 // Evaluate expression (should be constant for INSERT)
                 let value = self.evaluate_expression(&values[idx], &HashMap::new())?;
+
                 key_parts.push(value.to_bytes());
             }
             
@@ -354,15 +371,18 @@ impl QueryExecutor {
                 key.extend_from_slice(&(part.len() as u32).to_le_bytes());
                 key.extend_from_slice(&part);
             }
-            
+            print!("Primary key found {:?}", key);
             Ok(key)
         } else {
             // No primary key - use all columns
+            
             let mut row_data = Vec::new();
             for value in values {
                 let val = self.evaluate_expression(value, &HashMap::new())?;
                 row_data.extend_from_slice(&val.to_bytes());
             }
+
+            print!("no primary key found {:?}", row_data);
             Ok(row_data)
         }
     }
@@ -592,6 +612,7 @@ impl QueryExecutor {
         self.value_to_bool(&value)
     }
     
+    // convert to truthy value
     fn value_to_bool(&self, value: &Value) -> Result<bool, SqlError> {
         match value {
             Value::Boolean(b) => Ok(*b),
@@ -622,6 +643,58 @@ impl QueryExecutor {
             }),
         }
     }
+
+    /*
+    let x = String::from("hello");
+    let closure = || {
+        let moved = x;  // Moves x into closure
+        println!("{}", moved);
+        moved  // Consumes moved
+    };
+
+    closure();  // OK - first call
+    // closure();  // ERROR! Can't call again - x was moved
+     */
+
+    /*
+        FnMut - Can be called MUTably
+        Signature: FnMut(A, B, ...) -> R
+
+        Meaning: The function mutably borrows captured variables (&mut)
+
+        Can be called multiple times, but not concurrently
+
+        Example: A closure that modifies captured values
+
+        let mut counter = 0;
+        let mut closure = || {
+            counter += 1;  // Mutably borrows counter
+            println!("Count: {}", counter);
+        };
+
+        closure();  // OK - Count: 1
+        closure();  // OK - Count: 2
+        closure();  // OK - Count: 3
+
+
+        Fn - Can be called immutably
+        Signature: Fn(A, B, ...) -> R
+
+        Meaning: The function immutably borrows captured variables (&)
+
+        Can be called multiple times, even concurrently
+
+        Example: A closure that only reads captured values
+
+        let x = 10;
+        let closure = || {
+            println!("x = {}", x);  // Immutably borrows x
+        };
+
+        closure();  // OK
+        closure();  // OK - can call multiple times
+        closure();  // OK - can even call concurrently
+     */
     
     fn arithmetic_op<F>(
         &self,
@@ -630,7 +703,9 @@ impl QueryExecutor {
         op: F,
     ) -> Result<Value, SqlError>
     where
-        F: FnOnce(i64, i64) -> i64,
+        // FnOnce Can only be called once because it might move/consume captured values
+        // The function consumes/takes ownership of its captured variables
+        F: FnOnce(i64, i64) -> i64, // Constraint: op must be a function taking two i64s and returning i64
     {
         match (left, right) {
             (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(op(*a, *b))),
