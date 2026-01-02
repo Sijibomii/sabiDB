@@ -25,10 +25,12 @@ impl QueryParser {
     
     /// Parse a SQL string into AST statements
     pub fn parse(&self, sql: &str) -> Result<Vec<Statement>, SqlError> {
+        // use the sql parser library to parse SQL and generate statements
         let statements = Parser::parse_sql(&self.dialect, sql)?;
         
         let mut ast_statements = Vec::new();
         for stmt in statements {
+            // convert the sqlparser AST to our internal AST
             ast_statements.push(self.convert_statement(stmt)?);
         }
         

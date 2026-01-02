@@ -1,6 +1,8 @@
 //! Abstract Syntax Tree for SQL queries
-
-// use sqlparser::ast::ColumnDef;
+/*
+An Abstract Syntax Tree (AST) for an SQL database is a structured, tree-shaped representation 
+of an SQL query after it has been parsed, but before it is executed.
+*/
 
 use crate::types::{ColumnDef, Value};
 
