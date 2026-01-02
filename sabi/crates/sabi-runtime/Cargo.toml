@@ -11,3 +11,7 @@ sabi-sql = { path = "../sabi-sql" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0.17"
+
+# JavaScript runtime
+deno_core = "0.350.0"
+serde_v8 = "0.259.0"
