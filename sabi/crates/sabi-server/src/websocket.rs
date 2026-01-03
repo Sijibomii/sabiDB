@@ -2,18 +2,17 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, timeout};
+use tokio::sync::{mpsc};
+use tokio::time::{interval};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
-use tracing::{info, warn, error, debug};
 use uuid::Uuid;
 use serde_json::json;
+use bytes::Bytes;
 
 use crate::{
     SabiServer,
-    protocol::*,
-    client_tracker::ClientState,
+    protocol::*
 };
 
 /// WebSocket connection handler
@@ -27,9 +26,9 @@ impl WebSocketHandler {
     }
     
     /// Handle new WebSocket connection
-    pub async fn handle_connection(self, mut socket: WebSocket) {
-        let client_id = Uuid::new_v4();
-        info!("New WebSocket connection: {}", client_id);
+    pub async fn handle_connection(self, socket: WebSocket) {
+        let client_id = Uuid::now_v7();
+        print!("New WebSocket connection: {}", client_id);
         
         // Update metrics
         {
@@ -47,7 +46,7 @@ impl WebSocketHandler {
         let (tx, mut rx) = mpsc::channel::<Message>(100);
         
         // Spawn task to send messages to client
-        let mut write_socket = socket.clone();
+        let (mut write_socket, mut read_socket) = socket.split();
         let write_task = tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 if write_socket.send(message).await.is_err() {
@@ -63,11 +62,11 @@ impl WebSocketHandler {
         loop {
             tokio::select! {
                 // Receive message from client
-                result = socket.recv() => {
+                result = read_socket.next() => {
                     match result {
                         Some(Ok(Message::Text(text))) => {
                             if let Err(e) = self.handle_message(client_id, &text, &tx).await {
-                                error!("Error handling message from {}: {}", client_id, e);
+                                print!("Error handling message from {}: {}", client_id, e);
                                 break;
                             }
                         }
@@ -77,15 +76,15 @@ impl WebSocketHandler {
                             last_heartbeat = Instant::now();
                         }
                         Some(Ok(Message::Close(_))) => {
-                            info!("Client {} closed connection", client_id);
+                            print!("Client {} closed connection", client_id);
                             break;
                         }
                         Some(Err(e)) => {
-                            error!("WebSocket error from {}: {}", client_id, e);
+                            print!("WebSocket error from {}: {}", client_id, e);
                             break;
                         }
                         None => {
-                            info!("Client {} disconnected", client_id);
+                            print!("Client {} disconnected", client_id);
                             break;
                         }
                         _ => {
@@ -97,12 +96,12 @@ impl WebSocketHandler {
                 // Send heartbeat
                 _ = heartbeat_interval.tick() => {
                     if last_heartbeat.elapsed() > Duration::from_secs(60) {
-                        warn!("Client {} heartbeat timeout", client_id);
+                        print!("Client {} heartbeat timeout", client_id);
                         break;
                     }
                     
                     // Send ping
-                    let _ = tx.send(Message::Ping(vec![])).await;
+                    let _ = tx.send(Message::Ping(Bytes::new())).await;
                 }
                 
                 // Check for shutdown
@@ -113,7 +112,7 @@ impl WebSocketHandler {
         }
         
         // Cleanup
-        info!("Cleaning up WebSocket connection for {}", client_id);
+        print!("Cleaning up WebSocket connection for {}", client_id);
         
         // Remove client
         {
@@ -130,8 +129,6 @@ impl WebSocketHandler {
         // Cancel write task
         write_task.abort();
         
-        // Close socket
-        let _ = socket.close().await;
     }
     
     /// Handle incoming WebSocket message
@@ -141,7 +138,7 @@ impl WebSocketHandler {
         text: &str,
         tx: &mpsc::Sender<Message>,
     ) -> Result<(), String> {
-        debug!("Received message from {}: {}", client_id, text);
+        print!("Received message from {}: {}", client_id, text);
         
         // Parse envelope
         let envelope: MessageEnvelope = serde_json::from_str(text)
@@ -216,14 +213,34 @@ impl WebSocketHandler {
         };
         
         let message = Message::Text(
-            serde_json::to_string(&envelope)
-                .map_err(|e| format!("Failed to serialize envelope: {}", e))?
+            serde_json::to_string(&envelope) 
+                // .into() converts a value from one type to another, provided that: The source type implements Into<TargetType> trait Or the target type implements From<SourceType> trait (these two are reciprocal)
+                /*
+                // When you write:
+                let string: String = "hello".to_string();
+                let utf8_bytes: Utf8Bytes = string.into();
+
+                // This works because Utf8Bytes likely implements:
+                impl From<String> for Utf8Bytes {
+                    fn from(s: String) -> Self {
+                        Utf8Bytes::new(s.into_bytes())
+                    }
+                }
+
+                // Or String implements:
+                impl Into<Utf8Bytes> for String {
+                    fn into(self) -> Utf8Bytes {
+                        Utf8Bytes::new(self.into_bytes())
+                    }
+}
+                 */
+                .map_err(|e| format!("Failed to serialize envelope: {}", e))?.into() 
         );
         
         tx.send(message).await
             .map_err(|e| format!("Failed to send WELCOME: {}", e))?;
         
-        info!("Sent WELCOME to client {}, current_tx={}", client_id, current_tx);
+        print!("Sent WELCOME to client {}, current_tx={}", client_id, current_tx);
         
         // Replay missed updates if needed
         if let Some(last_seen_tx) = hello.last_seen_tx {
@@ -269,13 +286,13 @@ impl WebSocketHandler {
         
         let message = Message::Text(
             serde_json::to_string(&envelope)
-                .map_err(|e| format!("Failed to serialize envelope: {}", e))?
+                .map_err(|e| format!("Failed to serialize envelope: {}", e))?.into()
         );
         
         tx.send(message).await
             .map_err(|e| format!("Failed to send ACK: {}", e))?;
         
-        info!("Created subscription {} for client {}", subscription_id, client_id);
+        print!("Created subscription {} for client {}", subscription_id, client_id);
         
         Ok(())
     }
@@ -285,7 +302,7 @@ impl WebSocketHandler {
         &self,
         client_id: Uuid,
         payload: serde_json::Value,
-        tx: &mpsc::Sender<Message>,
+        _: &mpsc::Sender<Message>,
     ) -> Result<(), String> {
         let unsubscribe: UnsubscribeRequest = serde_json::from_value(payload)
             .map_err(|e| format!("Invalid UNSUBSCRIBE message: {}", e))?;
@@ -294,7 +311,7 @@ impl WebSocketHandler {
         self.server.remove_subscription(client_id, &unsubscribe.subscription_id).await
             .map_err(|e| e.to_string())?;
         
-        info!("Removed subscription {} for client {}", unsubscribe.subscription_id, client_id);
+        print!("Removed subscription {} for client {}", unsubscribe.subscription_id, client_id);
         
         Ok(())
     }
@@ -307,7 +324,7 @@ impl WebSocketHandler {
         to_tx: u64,
         tx: &mpsc::Sender<Message>,
     ) -> Result<(), String> {
-        info!("Replaying updates for client {} from tx {} to {}", client_id, from_tx, to_tx);
+        print!("Replaying updates for client {} from tx {} to {}", client_id, from_tx, to_tx);
         
         // In a real implementation, you would:
         // 1. Query WAL for changes between from_tx and to_tx
@@ -338,7 +355,7 @@ impl WebSocketHandler {
         
         let message = Message::Text(
             serde_json::to_string(&envelope)
-                .map_err(|e| format!("Failed to serialize envelope: {}", e))?
+                .map_err(|e| format!("Failed to serialize envelope: {}", e))?.into()
         );
         
         tx.send(message).await
@@ -362,7 +379,7 @@ impl WebSocketHandler {
         };
         
         if let Ok(text) = serde_json::to_string(&envelope) {
-            let _ = tx.send(Message::Text(text)).await;
+            let _ = tx.send(Message::Text(text.into())).await;
         }
     }
 }

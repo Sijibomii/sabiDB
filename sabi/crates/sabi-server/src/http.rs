@@ -5,7 +5,6 @@ use axum::{
     Json,
     http::StatusCode,
 };
-use tracing::{info, warn};
 
 use crate::{
     SabiServer,
@@ -17,7 +16,7 @@ pub async fn handle_query(
     State(server): State<std::sync::Arc<SabiServer>>,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    info!("Processing query: {}", request.sql);
+    print!("Processing query: {}", request.sql);
     
     // Update metrics
     {
@@ -28,7 +27,7 @@ pub async fn handle_query(
     match server.execute_sql_query(&request.sql, request.args, request.at_tx).await {
         Ok(response) => Ok(Json(response)),
         Err(error) => {
-            warn!("Query failed: {}", error.message);
+            print!("Query failed: {}", error.message);
             Err((StatusCode::BAD_REQUEST, Json(error)))
         }
     }
@@ -39,12 +38,12 @@ pub async fn handle_mutation(
     State(server): State<std::sync::Arc<SabiServer>>,
     Json(request): Json<MutationRequest>,
 ) -> Result<Json<MutationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    info!("Processing mutation: {}", request.sql);
+    print!("Processing mutation: {}", request.sql);
     
     match server.execute_sql_mutation(&request.sql, request.args, request.client_tx).await {
         Ok(response) => Ok(Json(response)),
         Err(error) => {
-            warn!("Mutation failed: {}", error.message);
+            print!("Mutation failed: {}", error.message);
             Err((StatusCode::BAD_REQUEST, Json(error)))
         }
     }
@@ -56,12 +55,12 @@ pub async fn handle_function(
     Path(name): Path<String>,
     Json(request): Json<FunctionRequest>,
 ) -> Result<Json<FunctionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    info!("Executing function: {}", name);
+    print!("Executing function: {}", name);
     
     match server.execute_function(&name, request.args).await {
         Ok(response) => Ok(Json(response)),
         Err(error) => {
-            warn!("Function execution failed: {}", error.message);
+            print!("Function execution failed: {}", error.message);
             Err((StatusCode::BAD_REQUEST, Json(error)))
         }
     }

@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use std::fmt;
 
 /// Protocol version
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -150,6 +151,19 @@ pub enum ErrorCode {
     RateLimited,
 }
 
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErrorCode::SerializationFailure => write!(f, "SERIALIZATION_FAILURE"),
+            ErrorCode::SyntaxError => write!(f, "SYNTAX_ERROR"),
+            ErrorCode::Internal => write!(f, "INTERNAL"),
+            ErrorCode::NotFound => write!(f, "NOT_FOUND"),
+            ErrorCode::Unauthorized => write!(f, "UNAUTHORIZED"),
+            ErrorCode::RateLimited => write!(f, "RATE_LIMITED"),
+        }
+    }
+}
+
 /// Error response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -157,6 +171,15 @@ pub struct ErrorResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
+}
+
+impl fmt::Display for ErrorResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.details {
+            Some(details) => write!(f, "{}: {} - Details: {}", self.code, self.message, details),
+            None => write!(f, "{}: {}", self.code, self.message),
+        }
+    }
 }
 
 /// Client state
