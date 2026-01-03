@@ -37,9 +37,9 @@ pub struct SabiServer {
     reactive_engine: Arc<ReactiveEngine>,
     query_executor: QueryExecutor,
     mutation_executor: MutationExecutor,
-    client_tracker: Arc<RwLock<ClientTracker>>,
-    current_tx_id: Arc<RwLock<u64>>,
-    metrics: Arc<Mutex<ServerMetrics>>,
+    pub client_tracker: Arc<RwLock<ClientTracker>>,
+    pub current_tx_id: Arc<RwLock<u64>>,
+    pub metrics: Arc<Mutex<ServerMetrics>>,
     shutdown_tx: mpsc::Sender<()>,
 }
 
