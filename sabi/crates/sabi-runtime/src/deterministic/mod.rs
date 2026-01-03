@@ -24,10 +24,12 @@
     External I/O (network calls, file reads)
 */
 
+use futures::executor::block_on;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use serde_json::Value as JsonValue;
-use deno_core::{JsRuntime, RuntimeOptions, serde_v8, v8};
+use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions, serde_v8, v8};
 use sabi_core::TxId;
 
 use crate::types::{JsValue, DeterministicEnv, FunctionResult, TransactionContext};
@@ -47,40 +49,38 @@ pub struct DeterministicRuntime {
 }
 
 impl DeterministicRuntime {
+    
     pub fn new() -> Result<Self, RuntimeError> {
-        // let mut runtime = JsRuntime::new(RuntimeOptions {
-        //     // will_snapshot: true,
-        //     extensions: vec![
-        //         // Register deterministic APIs
-        //         deno_core::Extension::builder()
-        //             .js(deno_core::include_js_files!(
-        //                 "deterministic_apis",
-        //                 "src/deterministic/apis.js",
-        //             ))
-        //             .build(),
-        //     ],
-        //     ..Default::default()
-        // });
-
+        // Create extension with all required fields
+        let extension = deno_core::Extension {
+            name: "deterministic_apis",
+            deps: &[],  // No dependencies
+            js_files: Cow::Borrowed(&[]),
+            esm_files: Cow::Borrowed(&[]),
+            lazy_loaded_esm_files: Cow::Borrowed(&[]),
+            esm_entry_point: None,
+            ops: Cow::Borrowed(&[]),
+            objects: Cow::Borrowed(&[]),
+            external_references: Cow::Borrowed(&[]),
+            global_template_middleware: None,
+            global_object_middleware: None,
+            op_state_fn: None,
+            needs_lazy_init: false,
+            middleware_fn: None,
+            enabled: true,
+        };
+        
         let mut runtime = JsRuntime::new(RuntimeOptions {
-            extensions: vec![
-                // Register deterministic APIs
-                deno_core::Extension {
-                    name: "deterministic_apis",
-                    js_files: std::borrow::Cow::Borrowed(&[
-                        deno_core::ExtensionFileSource {
-                            specifier: "ext:deterministic_apis/apis.js",
-                            code: deno_core::ExtensionFileSourceCode::IncludedInBinary(
-                                include_str!("apis.js")
-                            ),
-                        }
-                    ]),
-                    ..Default::default()
-                },
-            ],
+            extensions: vec![extension],
             ..Default::default()
         });
+
+        // Load your JavaScript file directly
+        let js_code = std::fs::read_to_string("src/deterministic/apis.js")
+            .map_err(|e| RuntimeError::IoError(e.to_string()))?;
         
+        runtime.execute_script("deterministic_apis.js", js_code).unwrap();
+
         // Initialize deterministic APIs
         Self::init_deterministic_apis(&mut runtime)?;
         
@@ -204,7 +204,7 @@ impl DeterministicRuntime {
         console.log("Deterministic runtime initialized");
         "#;
         
-        runtime.execute_script("[deterministic]", code.into())
+        runtime.execute_script("[deterministic]", code)
             .map_err(|e| RuntimeError::FunctionError(format!("Failed to init APIs: {}", e)))?;
         
         Ok(())
@@ -281,6 +281,8 @@ impl DeterministicRuntime {
         env: DeterministicEnv,
     ) -> Result<FunctionResult, RuntimeError> {
         let start_time = std::time::Instant::now();
+
+        print!("executing function type: {:?}; name {:?}", function_type, function_name);
         
         // Get function source code
         let functions = self.functions.lock()?;
@@ -338,15 +340,23 @@ impl DeterministicRuntime {
             source, js_args_str
         );
         
+        let script_name = format!("[{}]", function_name);
+        let static_name: &'static str = Box::leak(script_name.into_boxed_str());
         // execute_script(...) => Sends the code to V8 (the JavaScript engine)
-        let result = runtime.execute_script(&format!("[{}]", function_name), js_code.into())
+        let result = runtime.execute_script(static_name, js_code)
+        // let result = runtime.execute_script(&format!("[{}]", function_name), js_code)
             .map_err(|e| RuntimeError::FunctionError(format!("Execution failed: {}", e)))?;
         
         // allow all pending ops to complete
         // poll_event_loop(false, None) ==> false = Don't wait indefinitely, None = No timeout
-        let result_value = runtime.poll_event_loop(false, None)
-            .map_err(|e| RuntimeError::FunctionError(format!("Event loop failed: {}", e)))?;
-        
+        // I should probably await this properly and not use block_on but not sure I want to deal with async bs
+        let result_value = block_on(runtime.run_event_loop(PollEventLoopOptions {
+            wait_for_inspector: false,
+            pump_v8_message_loop: true,
+        }))
+        .map_err(|e| RuntimeError::FunctionError(format!("Event loop failed: {}", e)))?;
+    
+    
         // Extract result from V8
         //  Get a V8 Scope; V8 uses "handles" to manage JavaScript values (for garbage collection); A "scope" is like a context where these handles are valid
         let scope = &mut runtime.handle_scope();
@@ -408,16 +418,16 @@ impl DeterministicRuntime {
         // Set deterministic random seed here needed when executing the function
         let seed_code = format!("_randomSeed = {};", env.random_seed);
         // run code to set the random seed
-        runtime.execute_script("[set_seed]", seed_code.into())
+        runtime.execute_script("[set_seed]", seed_code)
             .map_err(|e| RuntimeError::FunctionError(format!("Failed to set seed: {}", e)))?;
         
         // Set deterministic time
         let time_code = format!("globalThis.__deterministicTime = {};", env.logical_time);
-        runtime.execute_script("[set_time]", time_code.into())
+        runtime.execute_script("[set_time]", time_code)
             .map_err(|e| RuntimeError::FunctionError(format!("Failed to set time: {}", e)))?;
         
         // Reset dependency tracking
-        runtime.execute_script("[reset]", "globalThis.__readKeys = new Set(); globalThis.__writtenKeys = new Set();".into())
+        runtime.execute_script("[reset]", "globalThis.__readKeys = new Set(); globalThis.__writtenKeys = new Set();")
             .map_err(|e| RuntimeError::FunctionError(format!("Failed to reset: {}", e)))?;
         
         Ok(())

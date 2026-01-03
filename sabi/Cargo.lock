@@ -1181,6 +1181,7 @@ name = "sabi-runtime"
 version = "0.1.0"
 dependencies = [
  "deno_core",
+ "futures",
  "sabi-core",
  "sabi-sql",
  "sabi-storage",
@@ -1188,6 +1189,7 @@ dependencies = [
  "serde_json",
  "serde_v8",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

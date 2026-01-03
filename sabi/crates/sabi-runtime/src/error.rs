@@ -7,6 +7,9 @@ use std::sync::PoisonError;
 pub enum RuntimeError {
     #[error("Determinism violation: {0}")]
     DeterminismViolation(String),
+
+    #[error("IO error: {0}")]
+    IoError(String),
     
     #[error("Function execution error: {0}")]
     FunctionError(String),
