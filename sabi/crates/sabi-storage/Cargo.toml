@@ -7,3 +7,6 @@ edition = "2024"
 sabi-core = { path = "../sabi-core" }
 crc32fast = "1.4"
 uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3"

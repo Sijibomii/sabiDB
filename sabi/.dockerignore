@@ -1,0 +1,42 @@
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE/Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.docker/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Tests (not needed in runtime image)
+tests/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.circleci/
+
+# Temporary files
+*.tmp
+*.log
+*.lock
+!Cargo.lock
+
+# OS files
+.DS_Store
+Thumbs.db

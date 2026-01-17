@@ -3,6 +3,9 @@ pub mod tx;
 pub mod timestamp;
 pub mod protocol;
 
+#[cfg(test)]
+mod tests;
+
 // Optional: convenience imports
 pub use error::DbError;
 pub use tx::TxId;

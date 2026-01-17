@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  sabi-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sabi-server:latest
+    container_name: sabi-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - sabi-data:/app/data
+    environment:
+      - RUST_LOG=debug
+      - SABI_ADDR=0.0.0.0:8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Test runner service for integration tests
+  integration-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      sabi-server:
+        condition: service_healthy
+    environment:
+      - SABI_SERVER_URL=http://sabi-server:8080
+    profiles:
+      - test
+
+volumes:
+  sabi-data:
+    driver: local

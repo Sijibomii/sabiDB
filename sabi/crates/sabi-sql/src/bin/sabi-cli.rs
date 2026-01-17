@@ -1,13 +1,12 @@
 //! Command-line interface for SabiDB
 
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use rustyline::{Editor, error::ReadlineError};
 use rustyline::history::DefaultHistory;
 
 use sabi_storage::page_file::PageFile;
-use sabi_storage::engine::{StorageEngine};
+use sabi_storage::engine::StorageEngine;
 use sabi_storage::wal::WalWriter;
 
 use sabi_sql::parser::QueryParser;
@@ -18,17 +17,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("SabiDB - A Simple MVCC Database");
     println!("Version 0.1.0");
     println!("Type 'help' for help, 'exit' to quit\n");
-    
-    // Initialize storage
+
+    // Initialize storage - StorageEngine is now internally thread-safe
     let pages = PageFile::open("sabidb.data")?;
     let wal = WalWriter::open("sabidb.wal")?;
-    let storage = Arc::new(Mutex::new(StorageEngine::new(pages, wal)?));
-    
+    let storage = Arc::new(StorageEngine::new(pages, wal)?);
+
     // Initialize SQL components
     let parser = QueryParser::new();
     let catalog = Catalog::new();
     let mut planner = QueryPlanner::new(catalog);
-    let mut executor = QueryExecutor::new(storage.clone(), planner.catalog.clone());
+    let mut executor = QueryExecutor::new(Arc::clone(&storage), planner.catalog.clone());
     
     // Setup readline with history
     let mut rl = Editor::<(), DefaultHistory>::new()?;

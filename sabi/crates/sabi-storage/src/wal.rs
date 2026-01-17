@@ -178,7 +178,7 @@ impl WalWriter {
     /// [ length (u32) | payload | checksum (u32) ]
     ///
     /// checksum = CRC32(payload)
-    pub fn append(&mut self, record: WalRecord) -> Result<()> {
+    pub fn append(&self, record: WalRecord) -> Result<()> {
         let payload = serialize_record(&record);
 
         // Creates a CRC32 checksum of the payload. this checksum is used to verify the integrity of the data when reading it back. It Protects against data corruption
@@ -236,7 +236,7 @@ impl WalReader {
             return Err(DbError::Corruption("Invalid WAL magic".into()));
         }
 
-        let version = u16::from_le_bytes([header[6], header[7]]);
+        let version = u16::from_le_bytes([header[7], header[8]]);
         if version != WAL_VERSION {
             return Err(DbError::Corruption(format!(
                 "Unsupported WAL version {}",
@@ -361,7 +361,7 @@ fn deserialize_record(payload: &[u8]) -> Result<WalRecord> {
 
     // 2. Read transaction ID (16 bytes)
     let tx_bytes: [u8; 16] = payload[cursor..cursor + 16].try_into().unwrap();
-    let tx = TxId(Uuid::from_slice(&tx_bytes).unwrap());
+    let tx = TxId(Uuid::from_bytes_le(tx_bytes));
     cursor += 16;
 
     // 3. Parse based on record type

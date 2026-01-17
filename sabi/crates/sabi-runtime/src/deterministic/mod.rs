@@ -5,56 +5,89 @@
 //! - No wall-clock time
 //! - No external I/O
 //! - All operations must be deterministic given same inputs
+//!
+//! Architecture:
+//! The JsRuntime is not Send+Sync, so we run it on a dedicated thread.
+//! Other threads communicate via channels to execute functions.
 
-/*
- deterministic JavaScript runtime - basically a sandboxed JavaScript environment where the 
- same inputs ALWAYS produce the same outputs, no matter when or where you run it.
-
- This is crucial because we need to ensure that every time a function is executed, it behaves exactly the same way,
- even if the function is run multiple times in different contexts or at different times.
- This means we have to control things like random number generation, time, and any side effects that
- might affect the outcome of the function.
- This is achieved by replacing non-deterministic APIs with deterministic versions,
- and by ensuring that all operations are logged in a way that allows us to replay them exactly.
-
- This code takes a regular JavaScript engine (Deno/V8) and removes all the "non-deterministic" parts - things that could give different results each time:
-
-    Random numbers
-    Current time/date
-    External I/O (network calls, file reads)
-*/
-
-use futures::executor::block_on;
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread::{self, JoinHandle};
+use std::borrow::Cow;
+
 use serde_json::Value as JsonValue;
 use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions, serde_v8, v8};
+use futures::executor::block_on;
 use sabi_core::TxId;
 
 use crate::types::{JsValue, DeterministicEnv, FunctionResult, TransactionContext};
 use crate::error::RuntimeError;
- 
-/// Deterministic JavaScript runtime
-pub struct DeterministicRuntime {
-    /// JavaScript runtime instances (one per isolate)
-    /// Arc makes this Thread-safe. Mutex ensures only one thread can access at a time  
-    runtime: Arc<Mutex<JsRuntime>>,
-    
-    /// Environment for deterministic operations
-    env: Arc<Mutex<HashMap<TxId, DeterministicEnv>>>,
-    
-    /// Global function registry
-    functions: Arc<Mutex<HashMap<String, String>>>,
+
+/// Commands sent to the runtime worker thread
+enum RuntimeCommand {
+    RegisterFunction {
+        name: String,
+        source: String,
+        response: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    ExecuteQuery {
+        tx_id: TxId,
+        function_name: String,
+        args: Vec<JsValue>,
+        response: oneshot::Sender<Result<FunctionResult, RuntimeError>>,
+    },
+    ExecuteMutation {
+        tx_id: TxId,
+        function_name: String,
+        args: Vec<JsValue>,
+        response: oneshot::Sender<Result<FunctionResult, RuntimeError>>,
+    },
+    ExecuteAction {
+        tx_id: TxId,
+        function_name: String,
+        args: Vec<JsValue>,
+        response: oneshot::Sender<Result<FunctionResult, RuntimeError>>,
+    },
+    Shutdown,
 }
 
-impl DeterministicRuntime {
-    
-    pub fn new() -> Result<Self, RuntimeError> {
-        // Create extension with all required fields
+/// Simple oneshot channel for responses
+mod oneshot {
+    use std::sync::mpsc;
+
+    pub struct Sender<T>(mpsc::Sender<T>);
+    pub struct Receiver<T>(mpsc::Receiver<T>);
+
+    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+        let (tx, rx) = mpsc::channel();
+        (Sender(tx), Receiver(rx))
+    }
+
+    impl<T> Sender<T> {
+        pub fn send(self, value: T) -> Result<(), T> {
+            self.0.send(value).map_err(|e| e.0)
+        }
+    }
+
+    impl<T> Receiver<T> {
+        pub fn recv(self) -> Result<T, mpsc::RecvError> {
+            self.0.recv()
+        }
+    }
+}
+
+/// The worker that owns the JsRuntime and runs on a dedicated thread
+struct RuntimeWorker {
+    runtime: JsRuntime,
+    env: HashMap<TxId, DeterministicEnv>,
+    functions: HashMap<String, String>,
+}
+
+impl RuntimeWorker {
+    fn new() -> Result<Self, RuntimeError> {
         let extension = deno_core::Extension {
             name: "deterministic_apis",
-            deps: &[],  // No dependencies
+            deps: &[],
             js_files: Cow::Borrowed(&[]),
             esm_files: Cow::Borrowed(&[]),
             lazy_loaded_esm_files: Cow::Borrowed(&[]),
@@ -69,84 +102,33 @@ impl DeterministicRuntime {
             middleware_fn: None,
             enabled: true,
         };
-        
+
         let mut runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![extension],
             ..Default::default()
         });
 
-        // Load your JavaScript file directly
-        let js_code = std::fs::read_to_string("src/deterministic/apis.js")
-            .map_err(|e| RuntimeError::IoError(e.to_string()))?;
-        
-        runtime.execute_script("deterministic_apis.js", js_code).unwrap();
+        // Load JavaScript file if it exists
+        if let Ok(js_code) = std::fs::read_to_string("src/deterministic/apis.js") {
+            runtime.execute_script("deterministic_apis.js", js_code)
+                .map_err(|e| RuntimeError::FunctionError(format!("Failed to load apis.js: {}", e)))?;
+        }
 
         // Initialize deterministic APIs
         Self::init_deterministic_apis(&mut runtime)?;
-        
+
         Ok(Self {
-            runtime: Arc::new(Mutex::new(runtime)),
-            env: Arc::new(Mutex::new(HashMap::new())),
-            functions: Arc::new(Mutex::new(HashMap::new())),
+            runtime,
+            env: HashMap::new(),
+            functions: HashMap::new(),
         })
     }
-    
+
     fn init_deterministic_apis(runtime: &mut JsRuntime) -> Result<(), RuntimeError> {
-        // Add deterministic Math.random replacement
-
-        // This code replaces the default Math.random and Date.now with deterministic versions
-        // and sets up a global database context for queries and mutations.
-        // It also ensures that all read/write operations are tracked for determinism.
-        // The code is executed in the JavaScript runtime to ensure it runs in the correct context
-        // and can access the global scope.
-        // This is crucial for ensuring that all operations are deterministic and can be replayed
-        // exactly the same way every time.
-
-        /*
-        
-        This replaces the built-in random function with a pseudo-random generator. Give it the same seed, 
-        get the same "random" sequence every time. It uses the Xorshift algorithm - a simple but effective way to generate pseudo-random numbers.
-
-        Math.random = function() {
-            _randomSeed ^= _randomSeed << 13;  // Xorshift algorithm
-            _randomSeed ^= _randomSeed >> 7;
-            _randomSeed ^= _randomSeed << 17;
-            return (_randomSeed >>> 0) / 4294967296;
-        };
-            ============================================
-
-
-        Instead of returning the actual current time, it returns a controlled "logical time" that you set. 
-        This means Date.now() gives you 0 (or whatever you set) instead of the real timestamp.
-
-        Date.now = function() {
-            return globalThis.__deterministicTime || 0;
-        };
-
-        ============================================
-
-        globalThis.db = {
-            query: (q, ...args) => { /* ... */ },
-            get: (key) => {
-                globalThis.__recordRead(key);  // Track what was read
-                return globalThis.__storageGet(key);
-            },
-            put: (key, value) => {
-                globalThis.__recordWrite(key);  // Track what was written
-                globalThis.__storagePut(key, value);
-            }
-        };
-
-        This creates a custom database API that tracks dependencies - which keys your function reads from or writes to. This is crucial for:
-
-        Caching (if inputs haven't changed, skip re-execution)
-        Conflict detection (did two transactions touch the same data?)
-        Replay (re-run transactions in the right order)
-         */
         let code = r#"
         // Deterministic random number generator
         let _randomSeed = 0;
-        
+
         // Replace Math.random with deterministic version
         const _originalMathRandom = Math.random;
         Math.random = function() {
@@ -156,13 +138,13 @@ impl DeterministicRuntime {
             _randomSeed ^= _randomSeed << 17;
             return (_randomSeed >>> 0) / 4294967296;
         };
-        
+
         // Replace Date.now with deterministic version
         const _originalDateNow = Date.now;
         Date.now = function() {
             return globalThis.__deterministicTime || 0;
         };
-        
+
         // Replace new Date() with deterministic version
         const _originalDate = Date;
         Date = function(...args) {
@@ -171,12 +153,12 @@ impl DeterministicRuntime {
             }
             return new _originalDate(...args);
         };
-        
+
         // Prohibit certain non-deterministic APIs
         Object.freeze(Math.random);
         Object.freeze(Date.now);
         Object.freeze(Date);
-        
+
         // Provide deterministic query and mutation context
         globalThis.db = {
             query: (q, ...args) => {
@@ -185,14 +167,12 @@ impl DeterministicRuntime {
             mutation: (m, ...args) => {
                 return globalThis.__executeMutation(m, args);
             },
-            // Read operations - track dependencies
             get: (key) => {
-                globalThis.__recordRead(key); // Track what was read
+                globalThis.__recordRead(key);
                 return globalThis.__storageGet(key);
             },
-            // Write operations - go through WAL
             put: (key, value) => {
-                globalThis.__recordWrite(key); // Track what was written
+                globalThis.__recordWrite(key);
                 globalThis.__storagePut(key, value);
             },
             delete: (key) => {
@@ -200,81 +180,98 @@ impl DeterministicRuntime {
                 globalThis.__storageDelete(key);
             },
         };
-        
+
         console.log("Deterministic runtime initialized");
         "#;
-        
+
         runtime.execute_script("[deterministic]", code)
             .map_err(|e| RuntimeError::FunctionError(format!("Failed to init APIs: {}", e)))?;
-        
+
         Ok(())
     }
-    
-    /// Register a function for later execution
-    pub fn register_function(&self, name: &str, source: &str) -> Result<(), RuntimeError> {
-        let mut functions = self.functions.lock()?;
-        functions.insert(name.to_string(), source.to_string());
+
+    fn run(mut self, receiver: Receiver<RuntimeCommand>) {
+        while let Ok(command) = receiver.recv() {
+            match command {
+                RuntimeCommand::RegisterFunction { name, source, response } => {
+                    let result = self.register_function(&name, &source);
+                    let _ = response.send(result);
+                }
+                RuntimeCommand::ExecuteQuery { tx_id, function_name, args, response } => {
+                    let result = self.execute_query(tx_id, &function_name, args);
+                    let _ = response.send(result);
+                }
+                RuntimeCommand::ExecuteMutation { tx_id, function_name, args, response } => {
+                    let result = self.execute_mutation(tx_id, &function_name, args);
+                    let _ = response.send(result);
+                }
+                RuntimeCommand::ExecuteAction { tx_id, function_name, args, response } => {
+                    let result = self.execute_action(tx_id, &function_name, args);
+                    let _ = response.send(result);
+                }
+                RuntimeCommand::Shutdown => {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn register_function(&mut self, name: &str, source: &str) -> Result<(), RuntimeError> {
+        self.functions.insert(name.to_string(), source.to_string());
         Ok(())
     }
-    
-    /// Execute a query function
-    pub fn execute_query(
-        &self,
+
+    fn execute_query(
+        &mut self,
         tx_id: TxId,
         function_name: &str,
         args: Vec<JsValue>,
     ) -> Result<FunctionResult, RuntimeError> {
-        let env = self.create_env(tx_id, true)?;
+        let env = self.create_env(tx_id, true);
         self.execute_function("query", function_name, args, env)
     }
-    
-    /// Execute a mutation function
-    pub fn execute_mutation(
-        &self,
+
+    fn execute_mutation(
+        &mut self,
         tx_id: TxId,
         function_name: &str,
         args: Vec<JsValue>,
     ) -> Result<FunctionResult, RuntimeError> {
-        let env = self.create_env(tx_id, false)?;
+        let env = self.create_env(tx_id, false);
         self.execute_function("mutation", function_name, args, env)
     }
-    
-    /// Execute an action function (read-write with external effects)
-    pub fn execute_action(
-        &self,
+
+    fn execute_action(
+        &mut self,
         tx_id: TxId,
         function_name: &str,
         args: Vec<JsValue>,
     ) -> Result<FunctionResult, RuntimeError> {
-        let env = self.create_env(tx_id, false)?;
+        let env = self.create_env(tx_id, false);
         self.execute_function("action", function_name, args, env)
     }
-    
-    fn create_env(&self, tx_id: TxId, is_read_only: bool) -> Result<DeterministicEnv, RuntimeError> {
-        let mut env_map = self.env.lock()?;
-        
-        if !env_map.contains_key(&tx_id) {
-            // Create new deterministic environment
+
+    fn create_env(&mut self, tx_id: TxId, is_read_only: bool) -> DeterministicEnv {
+        if !self.env.contains_key(&tx_id) {
             let seed = Self::generate_deterministic_seed(tx_id);
-            // insert deterministic context
             let context = TransactionContext {
                 tx_id: tx_id.0,
-                start_time: 0,  // Will be set by WAL position
+                start_time: 0,
                 is_read_only,
             };
-            
-            env_map.insert(tx_id, DeterministicEnv {
+
+            self.env.insert(tx_id, DeterministicEnv {
                 random_seed: seed,
                 logical_time: 0,
                 context,
             });
         }
-        
-        Ok(env_map[&tx_id].clone())
+
+        self.env[&tx_id].clone()
     }
-    
+
     fn execute_function(
-        &self,
+        &mut self,
         function_type: &str,
         function_name: &str,
         args: Vec<JsValue>,
@@ -282,53 +279,34 @@ impl DeterministicRuntime {
     ) -> Result<FunctionResult, RuntimeError> {
         let start_time = std::time::Instant::now();
 
-        print!("executing function type: {:?}; name {:?}", function_type, function_name);
-        
         // Get function source code
-        let functions = self.functions.lock()?;
-        let source = functions.get(function_name)
-            .ok_or_else(|| RuntimeError::InvalidFunction(function_name.to_string()))?;
-        
-        // Execute in JavaScript runtime
-        let mut runtime = self.runtime.lock()?;
-        
+        let source = self.functions.get(function_name)
+            .ok_or_else(|| RuntimeError::InvalidFunction(function_name.to_string()))?
+            .clone();
+
         // Set up execution environment
-        self.prepare_runtime(&mut runtime, env, &args)?;
-        
-        // Execute the function
-        // Convert Rust Values to JSON
-        // If args = [JsValue::Number(42), JsValue::String("hello")]
-        // Then js_args = [JsonValue::Number(42), JsonValue::String("hello")]
+        self.prepare_runtime(&env)?;
+
+        // Convert args to JSON
         let js_args: Vec<JsonValue> = args.iter()
             .map(|v| serde_json::to_value(v).unwrap())
             .collect();
-        
-        // Serialize to a JSON String
-        // js_args_str = "[42, "hello"]"
+
         let js_args_str = serde_json::to_string(&js_args)
             .map_err(RuntimeError::SerializationError)?;
-        
-        /*
-        The {} are placeholders in the format! macro that get replaced with: 
-        First {} → source (the function code) Second {} → js_args_str (the arguments as a JSON string)
 
-        const result = ({})(...{});
-         */
         let js_code = format!(
             r#"
             try {{
                 globalThis.__readKeys = new Set();
                 globalThis.__writtenKeys = new Set();
-                
-                // Execute the function
-                // This is an IIFE (Immediately Invoked Function Expression)
+
                 const result = ({})(...{});
-                
-                // Collect dependency info
+
                 const readKeys = Array.from(globalThis.__readKeys);
                 const writtenKeys = Array.from(globalThis.__writtenKeys);
-                
-                {{ 
+
+                {{
                     value: result,
                     readKeys,
                     writtenKeys
@@ -339,68 +317,49 @@ impl DeterministicRuntime {
             "#,
             source, js_args_str
         );
-        
-        let script_name = format!("[{}]", function_name);
+
+        let script_name = format!("[{}:{}]", function_type, function_name);
         let static_name: &'static str = Box::leak(script_name.into_boxed_str());
-        // execute_script(...) => Sends the code to V8 (the JavaScript engine)
-        let result = runtime.execute_script(static_name, js_code)
-        // let result = runtime.execute_script(&format!("[{}]", function_name), js_code)
+
+        let result = self.runtime.execute_script(static_name, js_code)
             .map_err(|e| RuntimeError::FunctionError(format!("Execution failed: {}", e)))?;
-        
-        // allow all pending ops to complete
-        // poll_event_loop(false, None) ==> false = Don't wait indefinitely, None = No timeout
-        // I should probably await this properly and not use block_on but not sure I want to deal with async bs
-        let result_value = block_on(runtime.run_event_loop(PollEventLoopOptions {
+
+        // Run event loop to completion
+        let _ = block_on(self.runtime.run_event_loop(PollEventLoopOptions {
             wait_for_inspector: false,
             pump_v8_message_loop: true,
-        }))
-        .map_err(|e| RuntimeError::FunctionError(format!("Event loop failed: {}", e)))?;
-    
-    
+        }));
+
         // Extract result from V8
-        //  Get a V8 Scope; V8 uses "handles" to manage JavaScript values (for garbage collection); A "scope" is like a context where these handles are valid
-        let scope = &mut runtime.handle_scope();
+        let scope = &mut self.runtime.handle_scope();
         let local_result = v8::Local::new(scope, result);
 
-        // Deserialize from V8 to JSON
         let result_json: JsonValue = serde_v8::from_v8(scope, local_result)
             .map_err(|e| RuntimeError::FunctionError(format!("Failed to deserialize result: {}", e)))?;
-        
-        /*
-        Expected Json structure:
-        {
-            "value": <the actual result>,
-            "readKeys": ["key1", "key2"],
-            "writtenKeys": ["key3"]
-        } 
 
-        or 
-
-        {
-            "error": "Something went wrong"
-        }
-         */
         // Parse result
         if let Some(error) = result_json.get("error") {
-            return Err(RuntimeError::FunctionError(error.as_str().unwrap().to_string()));
+            return Err(RuntimeError::FunctionError(
+                error.as_str().unwrap_or("Unknown error").to_string()
+            ));
         }
-        
-        // result_json must have "value", "readKeys", "writtenKeys
-        let value = serde_json::from_value(result_json.get("value").unwrap().clone())
-            .map_err(RuntimeError::SerializationError)?;
-        
+
+        let value = serde_json::from_value(
+            result_json.get("value").cloned().unwrap_or(JsonValue::Null)
+        ).map_err(RuntimeError::SerializationError)?;
+
         let read_keys: Vec<String> = result_json.get("readKeys")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
-        
+
         let written_keys: Vec<String> = result_json.get("writtenKeys")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
-        
+
         let duration_ns = start_time.elapsed().as_nanos() as u64;
-        
+
         Ok(FunctionResult {
             value,
             keys_read: read_keys,
@@ -408,38 +367,162 @@ impl DeterministicRuntime {
             duration_ns,
         })
     }
-    
-    fn prepare_runtime(
-        &self,
-        runtime: &mut JsRuntime,
-        env: DeterministicEnv, // The deterministic environment to apply
-        args: &[JsValue], 
-    ) -> Result<(), RuntimeError> {
-        // Set deterministic random seed here needed when executing the function
+
+    fn prepare_runtime(&mut self, env: &DeterministicEnv) -> Result<(), RuntimeError> {
+        // Set deterministic random seed
         let seed_code = format!("_randomSeed = {};", env.random_seed);
-        // run code to set the random seed
-        runtime.execute_script("[set_seed]", seed_code)
+        self.runtime.execute_script("[set_seed]", seed_code)
             .map_err(|e| RuntimeError::FunctionError(format!("Failed to set seed: {}", e)))?;
-        
+
         // Set deterministic time
         let time_code = format!("globalThis.__deterministicTime = {};", env.logical_time);
-        runtime.execute_script("[set_time]", time_code)
+        self.runtime.execute_script("[set_time]", time_code)
             .map_err(|e| RuntimeError::FunctionError(format!("Failed to set time: {}", e)))?;
-        
+
         // Reset dependency tracking
-        runtime.execute_script("[reset]", "globalThis.__readKeys = new Set(); globalThis.__writtenKeys = new Set();")
-            .map_err(|e| RuntimeError::FunctionError(format!("Failed to reset: {}", e)))?;
-        
+        self.runtime.execute_script(
+            "[reset]",
+            "globalThis.__readKeys = new Set(); globalThis.__writtenKeys = new Set();"
+        ).map_err(|e| RuntimeError::FunctionError(format!("Failed to reset: {}", e)))?;
+
         Ok(())
     }
-    
+
     fn generate_deterministic_seed(tx_id: TxId) -> u64 {
-        // Use transaction ID and WAL position to generate seed
         let bytes = tx_id.0.as_bytes();
         let mut seed = 0u64;
         for (i, &byte) in bytes.iter().enumerate().take(8) {
             seed |= (byte as u64) << (i * 8);
         }
         seed
+    }
+}
+
+/// Thread-safe handle to the deterministic runtime.
+///
+/// This can be cloned and shared across threads. All JavaScript execution
+/// happens on a dedicated worker thread, with commands sent via channels.
+pub struct DeterministicRuntime {
+    sender: Sender<RuntimeCommand>,
+    _worker_handle: Option<JoinHandle<()>>,
+}
+
+// Safety: The sender is Send+Sync, and the JoinHandle is only used for cleanup
+unsafe impl Send for DeterministicRuntime {}
+unsafe impl Sync for DeterministicRuntime {}
+
+impl DeterministicRuntime {
+    /// Create a new deterministic runtime.
+    ///
+    /// This spawns a dedicated thread for JavaScript execution.
+    pub fn new() -> Result<Self, RuntimeError> {
+        let (sender, receiver) = mpsc::channel();
+
+        // Create worker on dedicated thread
+        let worker_handle = thread::Builder::new()
+            .name("js-runtime".to_string())
+            .spawn(move || {
+                match RuntimeWorker::new() {
+                    Ok(worker) => worker.run(receiver),
+                    Err(e) => {
+                        eprintln!("Failed to create JS runtime worker: {}", e);
+                    }
+                }
+            })
+            .map_err(|e| RuntimeError::IoError(format!("Failed to spawn runtime thread: {}", e)))?;
+
+        Ok(Self {
+            sender,
+            _worker_handle: Some(worker_handle),
+        })
+    }
+
+    /// Register a function for later execution
+    pub fn register_function(&self, name: &str, source: &str) -> Result<(), RuntimeError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.sender.send(RuntimeCommand::RegisterFunction {
+            name: name.to_string(),
+            source: source.to_string(),
+            response: response_tx,
+        }).map_err(|_| RuntimeError::FunctionError("Runtime thread disconnected".to_string()))?;
+
+        response_rx.recv()
+            .map_err(|_| RuntimeError::FunctionError("Failed to receive response".to_string()))?
+    }
+
+    /// Execute a query function
+    pub fn execute_query(
+        &self,
+        tx_id: TxId,
+        function_name: &str,
+        args: Vec<JsValue>,
+    ) -> Result<FunctionResult, RuntimeError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.sender.send(RuntimeCommand::ExecuteQuery {
+            tx_id,
+            function_name: function_name.to_string(),
+            args,
+            response: response_tx,
+        }).map_err(|_| RuntimeError::FunctionError("Runtime thread disconnected".to_string()))?;
+
+        response_rx.recv()
+            .map_err(|_| RuntimeError::FunctionError("Failed to receive response".to_string()))?
+    }
+
+    /// Execute a mutation function
+    pub fn execute_mutation(
+        &self,
+        tx_id: TxId,
+        function_name: &str,
+        args: Vec<JsValue>,
+    ) -> Result<FunctionResult, RuntimeError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.sender.send(RuntimeCommand::ExecuteMutation {
+            tx_id,
+            function_name: function_name.to_string(),
+            args,
+            response: response_tx,
+        }).map_err(|_| RuntimeError::FunctionError("Runtime thread disconnected".to_string()))?;
+
+        response_rx.recv()
+            .map_err(|_| RuntimeError::FunctionError("Failed to receive response".to_string()))?
+    }
+
+    /// Execute an action function (read-write with external effects)
+    pub fn execute_action(
+        &self,
+        tx_id: TxId,
+        function_name: &str,
+        args: Vec<JsValue>,
+    ) -> Result<FunctionResult, RuntimeError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.sender.send(RuntimeCommand::ExecuteAction {
+            tx_id,
+            function_name: function_name.to_string(),
+            args,
+            response: response_tx,
+        }).map_err(|_| RuntimeError::FunctionError("Runtime thread disconnected".to_string()))?;
+
+        response_rx.recv()
+            .map_err(|_| RuntimeError::FunctionError("Failed to receive response".to_string()))?
+    }
+
+    /// Shutdown the runtime worker thread
+    pub fn shutdown(&self) {
+        let _ = self.sender.send(RuntimeCommand::Shutdown);
+    }
+}
+
+impl Drop for DeterministicRuntime {
+    fn drop(&mut self) {
+        self.shutdown();
+        // Wait for worker thread to finish
+        if let Some(handle) = self._worker_handle.take() {
+            let _ = handle.join();
+        }
     }
 }

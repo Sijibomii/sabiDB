@@ -1,7 +1,7 @@
 pub mod ast;
 
 use sqlparser::{dialect::GenericDialect, parser::Parser};
-use crate::types::{ColumnDef, DataType, Value};
+use crate::types::{DataType, Value};
 pub use ast::*;
 use crate::error::SqlError;
 

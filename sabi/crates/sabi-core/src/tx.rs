@@ -27,6 +27,12 @@ impl Ord for TxId {
     }
 }
 
+impl Default for TxId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TxId {
     /// Extract timestamp as (seconds, nanoseconds) tuple
     fn extract_timestamp(&self) -> (u64, u32) {

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use sabi_core::TxId;
-use sabi_storage::engine::{StorageEngine};
+use sabi_storage::engine::StorageEngine;
 use sabi_storage::mvcc::Transaction;
 
-use crate::parser::{self, BinaryOperator, Expr, QueryParser, UnaryOperator};
+use crate::parser::{BinaryOperator, Expr, UnaryOperator};
 use crate::planner::{LogicalPlan, Catalog};
 use crate::types::{DataType, TableSchema, Value};
 use crate::error::SqlError;
@@ -27,17 +27,17 @@ pub enum QueryResult {
 
 /// Query executor - executes logical plans against storage
 pub struct QueryExecutor {
-    storage: Arc<Mutex<StorageEngine>>,
-    catalog: Catalog, // Database schema/metadata
-    current_transaction: Option<Transaction>, // Active transaction
+    storage: Arc<StorageEngine>,
+    catalog: Catalog,
+    current_transaction: Option<Transaction>,
     auto_commit: bool,
 }
 
 impl QueryExecutor {
-    pub fn new(storage: Arc<Mutex<StorageEngine>>, catalog: Catalog) -> Self {
+    pub fn new(storage: Arc<StorageEngine>, catalog: Catalog) -> Self {
         Self {
             storage,
-            catalog, 
+            catalog,
             current_transaction: None,
             auto_commit: true,
         }
@@ -77,25 +77,16 @@ impl QueryExecutor {
         schema: TableSchema,
         if_not_exists: bool,
     ) -> Result<QueryResult, SqlError> {
-        let mut storage = self.storage.lock().unwrap();
-        
-        // Check if table exists
-        if if_not_exists && storage.tables.contains_key(&schema.name) {
-            return Ok(QueryResult::CreateTable);
-        }
-        
-        // Create table in storage
-        storage.tables.insert(schema.name.clone(), sabi_storage::mvcc::MvccTable::new());
-        
-        // Add to catalog
+        // Check if table exists and create if needed
+        self.storage.create_table(&schema.name, if_not_exists)
+            .map_err(|e| SqlError::Storage(e))?;
 
-        print!("schema: {:?}", schema); 
+        print!("schema: {:?}", schema);
 
-        // executer adds to catalog
         self.catalog.add_table(schema.clone());
 
-        print!("catalog: {:?}", self.catalog.get_table(&schema.name)); 
-        
+        print!("catalog: {:?}", self.catalog.get_table(&schema.name));
+
         Ok(QueryResult::CreateTable)
     }
     
@@ -107,7 +98,7 @@ impl QueryExecutor {
         schema: TableSchema,
     ) -> Result<QueryResult, SqlError> {
         let tx = self.begin_transaction()?;
-        let mut storage = self.storage.lock().unwrap();
+        let storage = &self.storage;
 
         print!("table name: {:?}", table_name); 
         
@@ -148,7 +139,7 @@ impl QueryExecutor {
         schema: TableSchema,
     ) -> Result<QueryResult, SqlError> {
         let tx = self.begin_transaction()?;
-        let mut storage = self.storage.lock().unwrap();
+        let storage = &self.storage;
         
         // For now, do full table scan
         // TODO: Use B-Tree index when available
@@ -243,7 +234,7 @@ impl QueryExecutor {
         schema: TableSchema,
     ) -> Result<QueryResult, SqlError> {
         let tx = self.begin_transaction()?;
-        let mut storage = self.storage.lock().unwrap();
+        let storage = &self.storage;
         
         // For now, scan and delete matching rows
         let mut rows_deleted = 0;
@@ -286,7 +277,7 @@ impl QueryExecutor {
             ));
         }
         
-        let storage = self.storage.lock().unwrap();
+        let storage = &self.storage;
         let tx = storage.begin(false); // Read-write transaction
         self.current_transaction = Some(tx.clone());
         self.auto_commit = false;
@@ -298,7 +289,7 @@ impl QueryExecutor {
         let tx = self.current_transaction.take()
             .ok_or_else(|| SqlError::ExecutionError("No transaction to commit".into()))?;
         
-        let storage = self.storage.lock().unwrap();
+        let storage = &self.storage;
         storage.commit(tx.tx_id)
             .map_err(|e| SqlError::Storage(e))?;
         
@@ -310,7 +301,7 @@ impl QueryExecutor {
         let tx = self.current_transaction.take()
             .ok_or_else(|| SqlError::ExecutionError("No transaction to rollback".into()))?;
         
-        let storage = self.storage.lock().unwrap();
+        let storage = &self.storage;
         storage.abort(tx.tx_id)
             .map_err(|e| SqlError::Storage(e))?;
         
@@ -324,7 +315,7 @@ impl QueryExecutor {
         if let Some(ref tx) = self.current_transaction {
             Ok(tx.clone())
         } else {
-            let storage = self.storage.lock().unwrap();
+            let storage = &self.storage;
             Ok(storage.begin(true)) // Read-only for queries
         }
     }
