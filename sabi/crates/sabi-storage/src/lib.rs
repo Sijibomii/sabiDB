@@ -4,3 +4,6 @@ pub mod page;
 pub mod page_file;
 pub mod btree;
 pub mod engine;
+
+#[cfg(test)]
+mod tests;

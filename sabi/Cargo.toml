@@ -4,3 +4,20 @@ members = [
 ]
 
 resolver = "2"
+
+[workspace.metadata]
+# Workspace-level metadata
+
+# Root package for integration tests
+[package]
+name = "sabi-workspace"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+integration-tests = []
+
+[dev-dependencies]
+# For integration tests

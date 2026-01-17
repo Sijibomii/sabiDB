@@ -1611,8 +1611,13 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "sabi-core",
+ "tempfile",
  "uuid",
 ]
+
+[[package]]
+name = "sabi-workspace"
+version = "0.1.0"
 
 [[package]]
 name = "scopeguard"
