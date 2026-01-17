@@ -7,23 +7,27 @@ use tokio::time::interval;
 use axum::{
     Router,
     extract::{State, WebSocketUpgrade},
-    response::Response,
     routing::{post, get},
     Json,
 };
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn, error};
 use uuid::Uuid;
 
+use crate::protocol::*;
+
 use sabi_core::TxId;
-use sabi_storage::{StorageEngine, Transaction};
-use sabi_sql::{QueryParser, QueryPlanner, QueryExecutor as SqlExecutor, Catalog};
-use sabi_runtime::{DeterministicRuntime, ReactiveEngine, QueryExecutor, MutationExecutor};
+use sabi_storage::engine::StorageEngine;
+
+use sabi_sql::planner::{Catalog, QueryPlanner};
+use sabi_sql::parser::QueryParser;
+use sabi_sql::executor::QueryExecutor as SqlExecutor;
+use sabi_runtime::deterministic::DeterministicRuntime;
+use sabi_runtime::reactive::ReactiveEngine;
+use sabi_runtime::execution::{QueryExecutor, MutationExecutor};
 
 use crate::{
     http::{handle_query, handle_mutation, handle_function},
     websocket::WebSocketHandler,
-    protocol::*,
     client_tracker::ClientTracker,
 };
 
@@ -31,8 +35,8 @@ use crate::{
 pub struct SabiServer {
     storage: Arc<StorageEngine>,
     sql_parser: QueryParser,
-    sql_planner: QueryPlanner,
-    sql_executor: SqlExecutor,
+    sql_planner: Mutex<QueryPlanner>,
+    sql_executor: Mutex<SqlExecutor>,
     deterministic_runtime: Arc<DeterministicRuntime>,
     reactive_engine: Arc<ReactiveEngine>,
     query_executor: QueryExecutor,
@@ -46,43 +50,41 @@ pub struct SabiServer {
 impl SabiServer {
     /// Create a new server instance
     pub async fn new(
-        storage: Arc<StorageEngine>,
+        storage: StorageEngine,
         catalog: Catalog,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Wrap storage in Arc once - StorageEngine is now internally thread-safe
+        let storage = Arc::new(storage);
+
         // Initialize SQL components
         let sql_parser = QueryParser::new();
         let sql_planner = QueryPlanner::new(catalog.clone());
-        let sql_executor = SqlExecutor::new(storage.clone(), catalog);
-        
+        let sql_executor = SqlExecutor::new(Arc::clone(&storage), catalog);
+
         // Initialize deterministic runtime
         let deterministic_runtime = Arc::new(DeterministicRuntime::new()?);
         let reactive_engine = Arc::new(ReactiveEngine::new(deterministic_runtime.clone()));
-        
+
         // Initialize executors
         let query_executor = QueryExecutor::new(
-            reactive_engine.clone(),
-            storage.clone(),
+            Arc::clone(&reactive_engine),
+            Arc::clone(&storage),
             100, // max concurrent queries
         );
-        
-        let storage_mutex = Arc::new(Mutex::new(storage.as_ref().clone()));
+
         let mutation_executor = MutationExecutor::new(
-            deterministic_runtime.clone(),
-            reactive_engine.clone(),
-            storage_mutex,
+            Arc::clone(&deterministic_runtime),
+            Arc::clone(&reactive_engine),
+            Arc::clone(&storage),
         );
-        
+
         // Initialize client tracker
         let client_tracker = Arc::new(RwLock::new(ClientTracker::new()));
-        
+
         // Get current transaction ID
-        let current_tx = {
-            let storage = storage.lock().map_err(|_| "Storage lock poisoned")?;
-            storage.get_latest_tx_id()? as u64
-        };
-        
+        let current_tx = storage.get_latest_tx_id()? as u64;
         let current_tx_id = Arc::new(RwLock::new(current_tx));
-        
+
         // Initialize metrics
         let metrics = Arc::new(Mutex::new(ServerMetrics {
             connections: 0,
@@ -92,24 +94,24 @@ impl SabiServer {
             current_tx_id: current_tx,
             uptime_seconds: 0,
         }));
-        
+
         // Setup shutdown channel
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        
+
         // Start background tasks
-        let metrics_clone = metrics.clone();
-        let current_tx_id_clone = current_tx_id.clone();
-        let storage_clone = storage.clone();
-        
+        let metrics_clone = Arc::clone(&metrics);
+        let current_tx_id_clone = Arc::clone(&current_tx_id);
+        let storage_clone = Arc::clone(&storage);
+
         tokio::spawn(async move {
             Self::background_tasks(metrics_clone, current_tx_id_clone, storage_clone, shutdown_rx).await;
         });
-        
+
         Ok(Self {
             storage,
             sql_parser,
-            sql_planner,
-            sql_executor,
+            sql_planner: Mutex::new(sql_planner),
+            sql_executor: Mutex::new(sql_executor),
             deterministic_runtime,
             reactive_engine,
             query_executor,
@@ -120,33 +122,44 @@ impl SabiServer {
             shutdown_tx,
         })
     }
-    
+
     /// Start the server
     pub async fn start(self: Arc<Self>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let app = self.create_router();
-        
-        info!("Starting SabiDB server on {}", addr);
-        
+        let app = self.clone().create_router();
+
+        print!("Starting SabiDB server on {}", addr);
+
         let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        // Clone for the shutdown signal
+        let shutdown_tx = self.shutdown_tx.clone();
+        let shutdown_signal = async move {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C signal handler");
+            print!("Shutdown signal received");
+            let _ = shutdown_tx.send(()).await;
+        };
+
         axum::serve(listener, app)
-            .with_graceful_shutdown(self.shutdown_signal())
+            .with_graceful_shutdown(shutdown_signal)
             .await?;
-        
+
         Ok(())
     }
     
     /// Create Axum router
     fn create_router(self: Arc<Self>) -> Router {
         let state = Arc::clone(&self);
-        
+
         Router::new()
             // HTTP endpoints
             .route("/query", post(handle_query))
             .route("/mutate", post(handle_mutation))
             .route("/fn/:name", post(handle_function))
             .route("/health", get(|| async { "OK" }))
-            .route("/metrics", get(Self::handle_metrics))
-            
+            .route("/metrics", get(handle_metrics_endpoint))
+
             // WebSocket endpoint
             .route("/ws", get(move |ws: WebSocketUpgrade| {
                 let handler = WebSocketHandler::new(Arc::clone(&state));
@@ -154,18 +167,10 @@ impl SabiServer {
                     ws.on_upgrade(move |socket| handler.handle_connection(socket))
                 }
             }))
-            
+
             // State and middleware
-            .with_state(state)
+            .with_state(self)
             .layer(TraceLayer::new_for_http())
-    }
-    
-    /// Handle metrics endpoint
-    async fn handle_metrics(
-        State(server): State<Arc<Self>>,
-    ) -> Json<ServerMetrics> {
-        let metrics = server.metrics.lock().await;
-        Json(metrics.clone())
     }
     
     /// Background tasks for metrics, cleanup, etc.
@@ -184,36 +189,23 @@ impl SabiServer {
                     // Update metrics
                     let mut metrics_guard = metrics.lock().await;
                     metrics_guard.uptime_seconds = start_time.elapsed().as_secs();
-                    
+
                     // Update current transaction ID
-                    if let Ok(storage_guard) = storage.lock() {
-                        if let Ok(tx_id) = storage_guard.get_latest_tx_id() {
-                            *current_tx_id.write().await = tx_id as u64;
-                            metrics_guard.current_tx_id = tx_id as u64;
-                        }
+                    if let Ok(tx_id) = storage.get_latest_tx_id() {
+                        *current_tx_id.write().await = tx_id as u64;
+                        metrics_guard.current_tx_id = tx_id as u64;
                     }
-                    
+
                     // Reset per-second counters (simplified)
                     metrics_guard.queries_per_second = 0.0;
                     metrics_guard.mutations_per_second = 0.0;
                 }
                 _ = shutdown_rx.recv() => {
-                    info!("Shutting down background tasks");
+                    print!("Shutting down background tasks");
                     break;
                 }
             }
         }
-    }
-    
-    /// Shutdown signal handler
-    async fn shutdown_signal(&self) {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C signal handler");
-        info!("Shutdown signal received");
-        
-        // Clean shutdown
-        let _ = self.shutdown_tx.send(()).await;
     }
     
     /// Execute SQL query
@@ -240,34 +232,40 @@ impl SabiServer {
             })?;
         
         // Plan query
-        let plan = self.sql_planner.plan(stmt.clone())
-            .map_err(|e| ErrorResponse {
-                code: ErrorCode::SyntaxError,
-                message: format!("Query planning error: {}", e),
-                details: None,
-            })?;
-        
+        let plan = {
+            let mut planner = self.sql_planner.lock().await;
+            planner.plan(stmt.clone())
+                .map_err(|e| ErrorResponse {
+                    code: ErrorCode::SyntaxError,
+                    message: format!("Query planning error: {}", e),
+                    details: None,
+                })?
+        };
+
         // Execute query
-        let result = self.sql_executor.execute(plan)
-            .map_err(|e| ErrorResponse {
-                code: ErrorCode::Internal,
-                message: format!("Query execution error: {}", e),
-                details: None,
-            })?;
+        let result = {
+            let mut executor = self.sql_executor.lock().await;
+            executor.execute(plan)
+                .map_err(|e| ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("Query execution error: {}", e),
+                    details: None,
+                })?
+        };
         
         // Convert to response
         match result {
-            sabi_sql::QueryResult::Select { columns, rows } => {
+            sabi_sql::executor::QueryResult::Select { columns, rows } => {
                 let json_rows: Vec<serde_json::Value> = rows.into_iter()
                     .map(|row| {
                         let mut obj = serde_json::Map::new();
                         for (i, col) in columns.iter().enumerate() {
                             if i < row.len() {
                                 let value = match &row[i] {
-                                    sabi_sql::Value::Null => serde_json::Value::Null,
-                                    sabi_sql::Value::Integer(n) => serde_json::Value::Number((*n).into()),
-                                    sabi_sql::Value::Text(s) => serde_json::Value::String(s.clone()),
-                                    sabi_sql::Value::Boolean(b) => serde_json::Value::Bool(*b),
+                                    sabi_sql::types::Value::Null => serde_json::Value::Null,
+                                    sabi_sql::types::Value::Integer(n) => serde_json::Value::Number((*n).into()),
+                                    sabi_sql::types::Value::Text(s) => serde_json::Value::String(s.clone()),
+                                    sabi_sql::types::Value::Boolean(b) => serde_json::Value::Bool(*b),
                                 };
                                 obj.insert(col.clone(), value);
                             }
@@ -278,10 +276,7 @@ impl SabiServer {
                 
                 let read_tx = at_tx.unwrap_or_else(|| {
                     // Use latest transaction ID
-                    tokio::task::block_in_place(|| {
-                        let storage = self.storage.lock().unwrap();
-                        storage.get_latest_tx_id().unwrap_or(0) as u64
-                    })
+                    self.storage.get_latest_tx_id().unwrap_or(0) as u64
                 });
                 
                 Ok(QueryResponse {
@@ -333,7 +328,7 @@ impl SabiServer {
         args: serde_json::Value,
     ) -> Result<FunctionResponse, ErrorResponse> {
         // Convert args to JsValue
-        use sabi_runtime::JsValue;
+        use sabi_runtime::types::JsValue;
         let js_args = match args {
             serde_json::Value::Array(arr) => {
                 arr.into_iter()
@@ -352,7 +347,7 @@ impl SabiServer {
         };
         
         // Execute mutation
-        let mutation_def = sabi_runtime::MutationDef {
+        let mutation_def = sabi_runtime::types::MutationDef {
             name: name.to_string(),
             function: "".to_string(), // Already registered
             args: js_args,
@@ -393,7 +388,7 @@ impl SabiServer {
         query: &str,
         args: Vec<serde_json::Value>,
     ) -> Result<String, ErrorResponse> {
-        let subscription_id = format!("sub-{}", Uuid::new_v4());
+        let subscription_id = format!("sub-{}", Uuid::now_v7());
         
         // Store subscription in client tracker
         {
@@ -407,7 +402,7 @@ impl SabiServer {
             metrics.subscriptions += 1;
         }
         
-        info!("Created subscription {} for client {}", subscription_id, client_id);
+        print!("Created subscription {} for client {}", subscription_id, client_id);
         
         Ok(subscription_id)
     }
@@ -429,7 +424,7 @@ impl SabiServer {
             metrics.subscriptions = metrics.subscriptions.saturating_sub(1);
         }
         
-        info!("Removed subscription {} for client {}", subscription_id, client_id);
+        print!("Removed subscription {} for client {}", subscription_id, client_id);
         
         Ok(())
     }
@@ -442,7 +437,7 @@ impl SabiServer {
     ) -> Result<(), ErrorResponse> {
         // This would normally send via WebSocket
         // For now, just log
-        info!("Would send update to client {}: {:?}", client_id, update);
+        print!("Would send update to client {}: {:?}", client_id, update);
         Ok(())
     }
     
@@ -463,4 +458,12 @@ impl StorageEngineExt for StorageEngine {
         // In reality, you'd get this from the transaction manager
         Ok(1000) // Example value
     }
+}
+
+/// Standalone handler for metrics endpoint
+async fn handle_metrics_endpoint(
+    State(server): State<Arc<SabiServer>>,
+) -> Json<ServerMetrics> {
+    let metrics = server.metrics.lock().await;
+    Json(metrics.clone())
 }

@@ -178,7 +178,7 @@ impl WalWriter {
     /// [ length (u32) | payload | checksum (u32) ]
     ///
     /// checksum = CRC32(payload)
-    pub fn append(&mut self, record: WalRecord) -> Result<()> {
+    pub fn append(&self, record: WalRecord) -> Result<()> {
         let payload = serialize_record(&record);
 
         // Creates a CRC32 checksum of the payload. this checksum is used to verify the integrity of the data when reading it back. It Protects against data corruption

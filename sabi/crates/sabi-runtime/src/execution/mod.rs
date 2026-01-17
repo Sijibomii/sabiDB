@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use futures::future::BoxFuture;
 
 use sabi_core::TxId;
-use sabi_storage::engine::{StorageEngine};
+use sabi_storage::engine::StorageEngine;
 
 use crate::deterministic::DeterministicRuntime;
 use crate::reactive::{ReactiveEngine, QuerySubscriber};
@@ -82,7 +82,7 @@ impl QueryExecutor {
 pub struct MutationExecutor {
     deterministic: Arc<DeterministicRuntime>,
     reactive: Arc<ReactiveEngine>,
-    storage: Arc<Mutex<StorageEngine>>,
+    storage: Arc<StorageEngine>,
     wal_position: RwLock<u64>,
 }
 
@@ -90,7 +90,7 @@ impl MutationExecutor {
     pub fn new(
         deterministic: Arc<DeterministicRuntime>,
         reactive: Arc<ReactiveEngine>,
-        storage: Arc<Mutex<StorageEngine>>,
+        storage: Arc<StorageEngine>,
     ) -> Self {
         Self {
             deterministic,
@@ -107,29 +107,26 @@ impl MutationExecutor {
     ) -> Result<FunctionResult, RuntimeError> {
         // Generate transaction ID
         let tx_id = Uuid::now_v7();
-        
+
         // Log mutation start to WAL
         self.log_mutation_start(&mutation_def, tx_id)?;
-        
+
         // Execute mutation
         let result = self.reactive.execute_mutation(
             tx_id,
             &mutation_def.name,
             mutation_def.clone().args,
         )?;
-        
+
         // Log mutation result to WAL
         self.log_mutation_result(&mutation_def, tx_id, &result)?;
-        
+
         // Commit transaction
-        {
-            let storage = self.storage.lock().await;
-            storage.commit(TxId(tx_id))?;
-        }
-        
+        self.storage.commit(TxId(tx_id))?;
+
         // Update WAL position
         self.advance_wal_position()?;
-        
+
         Ok(result)
     }
     
@@ -179,14 +176,14 @@ impl MutationExecutor {
 /// Action executor for external effects
 pub struct ActionExecutor {
     deterministic: Arc<DeterministicRuntime>,
-    storage: Arc<Mutex<StorageEngine>>,
+    storage: Arc<StorageEngine>,
     external_services: HashMap<String, ExternalService>,
 }
 
 impl ActionExecutor {
     pub fn new(
         deterministic: Arc<DeterministicRuntime>,
-        storage: Arc<Mutex<StorageEngine>>,
+        storage: Arc<StorageEngine>,
     ) -> Self {
         Self {
             deterministic,
@@ -207,31 +204,28 @@ impl ActionExecutor {
     ) -> Result<FunctionResult, RuntimeError> {
         // Actions are like mutations but can have external effects
         // They still need to be deterministic for replay
-        
+
         let tx_id = Uuid::now_v7();
-        
+
         // Log action start
         self.log_action_start(&action_def, tx_id)?;
-        
+
         // Execute in deterministic runtime
         let result = self.deterministic.execute_action(
             TxId(tx_id),
             &action_def.name,
             action_def.args.clone(),
         )?;
-        
+
         // Perform external effects (logged to WAL)
         self.execute_external_effects(&action_def, &result).await?;
-        
+
         // Log action completion
         self.log_action_completion(&action_def, tx_id, &result)?;
-        
+
         // Commit internal changes
-        {
-            let storage = self.storage.lock().await;
-            storage.commit(TxId(tx_id))?;
-        }
-        
+        self.storage.commit(TxId(tx_id))?;
+
         Ok(result)
     }
     

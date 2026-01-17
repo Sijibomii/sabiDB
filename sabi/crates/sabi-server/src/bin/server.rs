@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 use clap::Parser;
-use tracing_subscriber;
 use sabi_server::SabiServer;
-use sabi_storage::{StorageEngine, PageFile, WalWriter};
-use sabi_sql::Catalog;
+use sabi_storage::engine::StorageEngine;
+use sabi_storage::page_file::PageFile;
+use sabi_storage::wal::WalWriter;
+use sabi_sql::planner::Catalog;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -53,15 +54,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Initialize storage
     let pages = PageFile::open(&args.data_file)?;
-    let wal = WalWriter::new(&args.wal_file)?;
-    let storage = Arc::new(StorageEngine::new(pages, wal)?);
-    
-    // Initialize catalog (load schema if provided)
-    let catalog = if let Some(schema_path) = args.schema {
-        Catalog::load_from_file(&schema_path)?
-    } else {
-        Catalog::new()
-    };
+    let wal = WalWriter::open(&args.wal_file)?;
+    let storage = StorageEngine::new(pages, wal)?;
+
+    // Initialize catalog
+    // TODO: Implement schema loading from file if args.schema is provided
+    let catalog = Catalog::new();
     
     // Create and start server
     let server = Arc::new(SabiServer::new(storage, catalog).await?);

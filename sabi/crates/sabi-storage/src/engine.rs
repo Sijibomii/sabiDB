@@ -1,41 +1,54 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, RwLock};
 use sabi_core::{DbError, TxId};
 use uuid::Uuid;
 
 use crate::mvcc::{VersionChain, is_visible};
 use crate::{btree::BTree, mvcc::{MvccTable, RowVersion, Transaction, TransactionManager}, page::{Page, PageType}, page_file::PageFile, wal::WalWriter};
 
+/// Thread-safe storage engine with internal locking.
+///
+/// All fields are wrapped in Arc for shared ownership, allowing the engine
+/// to be cloned and shared across threads. Internal synchronization is handled
+/// via Mutex/RwLock on individual components.
 pub struct StorageEngine {
     // Primary index (B+Tree mapping keys to data pages)
-    // Maps composite keys to data page IDs
-    pub primary_index: BTree,
-    
+    pub primary_index: Arc<Mutex<BTree>>,
+
     // MVCC table storage (stores actual data with version chains)
-    // In-memory MVCC tables
-    pub tables: BTreeMap<String, MvccTable>,
-    
-    // Transaction manager
-    // Manages active transactions
-    pub tx_manager: TransactionManager,
-    
-    // Page allocator
-    // Manages disk pages
-    pub pages: PageFile,
-    
-    // Write-ahead log
-    // Write-ahead logger for durability
+    pub tables: Arc<RwLock<BTreeMap<String, MvccTable>>>,
+
+    // Transaction manager (already internally thread-safe)
+    pub tx_manager: Arc<TransactionManager>,
+
+    // Page allocator (already Clone via internal Arc)
+    pub pages: Arc<RwLock<PageFile>>,
+
+    // Write-ahead log (already Clone via internal Arc)
     pub wal: WalWriter,
+}
+
+impl Clone for StorageEngine {
+    fn clone(&self) -> Self {
+        Self {
+            primary_index: Arc::clone(&self.primary_index),
+            tables: Arc::clone(&self.tables),
+            tx_manager: Arc::clone(&self.tx_manager),
+            pages: Arc::clone(&self.pages),
+            wal: self.wal.clone(),
+        }
+    }
 }
 
 impl StorageEngine {
     pub fn new(pages: PageFile, wal: WalWriter) -> Result<Self, DbError> {
         let btree = BTree::new(pages.clone(), wal.clone())?;
-        
+
         Ok(Self {
-            primary_index: btree,
-            tables: BTreeMap::new(),
-            tx_manager: TransactionManager::new(),
-            pages,
+            primary_index: Arc::new(Mutex::new(btree)),
+            tables: Arc::new(RwLock::new(BTreeMap::new())),
+            tx_manager: Arc::new(TransactionManager::new()),
+            pages: Arc::new(RwLock::new(pages)),
             wal,
         })
     }
@@ -59,6 +72,19 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Create a new table
+    pub fn create_table(&self, table_name: &str, if_not_exists: bool) -> Result<(), DbError> {
+        let mut tables = self.tables.write()
+            .map_err(|_| DbError::Internal("Tables lock poisoned".into()))?;
+
+        if if_not_exists && tables.contains_key(table_name) {
+            return Ok(());
+        }
+
+        tables.insert(table_name.to_string(), MvccTable::new());
+        Ok(())
+    }
+
     /*
         // Memory table: "Alice" → [v1@tx1]
         // Page 100: [v1@tx1]
@@ -70,121 +96,163 @@ impl StorageEngine {
      */
     
     // INSERT - MVCC-aware
-    pub fn insert(&mut self, table_name: &str, key: Vec<u8>, value: Vec<u8>, tx: &Transaction) -> Result<(), DbError> {
+    pub fn insert(&self, table_name: &str, key: Vec<u8>, value: Vec<u8>, tx: &Transaction) -> Result<(), DbError> {
         // 1. Allocate page for MVCC data
-        let data_page_id = self.pages.allocate_page()?;
-        
-        // 2. Store MVCC version in the data page
-        let table = self.tables.entry(table_name.to_string())
-            .or_insert_with(MvccTable::new);
-        
-        table.insert(key.clone(), value, tx);
-        
-        // 3. Serialize MVCC data to page
-        // This only serializes that specific key's versions, not the entire table. So there's no issue of double serialization
-        let serialized = Self::serialize_mvcc_data(&table, &key)?;
+        let data_page_id = {
+            let mut pages = self.pages.write()
+                .map_err(|_| DbError::Internal("Pages lock poisoned".into()))?;
+            pages.allocate_page()?
+        };
 
-        let mut page = Page::new(data_page_id, PageType::Data);
-        page.payload = serialized;
-        self.pages.write_page(&page)?;
-        
+        // 2. Store MVCC version in the data page
+        let serialized = {
+            let mut tables = self.tables.write()
+                .map_err(|_| DbError::Internal("Tables lock poisoned".into()))?;
+            let table = tables.entry(table_name.to_string())
+                .or_insert_with(MvccTable::new);
+            table.insert(key.clone(), value, tx);
+
+            // 3. Serialize MVCC data to page
+            Self::serialize_mvcc_data(table, &key)?
+        };
+
+        // Write page
+        {
+            let mut pages = self.pages.write()
+                .map_err(|_| DbError::Internal("Pages lock poisoned".into()))?;
+            let mut page = Page::new(data_page_id, PageType::Data);
+            page.payload = serialized;
+            pages.write_page(&page)?;
+        }
+
         // 4. Update B-Tree index (key → data_page_id)
         let composite_key = create_composite_key(table_name, &key);
-        self.primary_index.insert(composite_key, data_page_id, tx.tx_id)?;
-        
+        {
+            let mut index = self.primary_index.lock()
+                .map_err(|_| DbError::Internal("Primary index lock poisoned".into()))?;
+            index.insert(composite_key, data_page_id, tx.tx_id)?;
+        }
+
         // 5. Log to WAL (already done in BTree::insert via WalWriter)
         Ok(())
     }
     
     // GET - MVCC-aware
-    pub fn get(&mut self, table_name: &str, key: &[u8], tx: &Transaction) -> Result<Option<Vec<u8>>, DbError> {
-
+    pub fn get(&self, table_name: &str, key: &[u8], tx: &Transaction) -> Result<Option<Vec<u8>>, DbError> {
         let composite_key = create_composite_key(table_name, key);
 
         // Look up data page ID from B-Tree
-        let data_page_id = match self.primary_index.get(&composite_key)? {
-            Some(id) => id,
-            None => return Ok(None),
+        let data_page_id = {
+            let mut index = self.primary_index.lock()
+                .map_err(|_| DbError::Internal("Primary index lock poisoned".into()))?;
+            match index.get(&composite_key)? {
+                Some(id) => id,
+                None => return Ok(None),
+            }
         };
-        
+
         // Read the data page
-        let page = self.pages.read_page(data_page_id)?;
-        
+        let page = {
+            let mut pages = self.pages.write()
+                .map_err(|_| DbError::Internal("Pages lock poisoned".into()))?;
+            pages.read_page(data_page_id)?
+        };
+
         // Deserialize MVCC versions
-        let versions = self.deserialize_mvcc_data(&page)?;
-        
+        let versions = Self::deserialize_mvcc_data(&page)?;
+
         // Find visible version for this transaction
         for version in versions {
             if is_visible(&version, tx) {
                 return Ok(Some(version.value));
             }
         }
-        
+
         Ok(None)
     }
     
     // DELETE - MVCC-aware (tombstone)
-    pub fn delete(&mut self, table_name: &str, key: &[u8], tx: &Transaction) -> Result<(), DbError> {
-        // 1. Get data page ID
-
+    pub fn delete(&self, table_name: &str, key: &[u8], tx: &Transaction) -> Result<(), DbError> {
         let composite_key = create_composite_key(table_name, key);
 
-        let data_page_id = match self.primary_index.get(&composite_key)? {
-            Some(id) => id,
-            None => return Err(DbError::NotFound("Key not found".into())),
-        };
-        
-        // 2. Read current data
-        let page = self.pages.read_page(data_page_id)?;
-        let mut versions = self.deserialize_mvcc_data(&page)?;
-        
-        // 3. Mark latest visible version as deleted
-        for version in versions.iter_mut() {
-            if is_visible(version, tx) {
-                version.deleted_by = Some(tx.tx_id);
-                break;
+        // 1. Get data page ID
+        let data_page_id = {
+            let mut index = self.primary_index.lock()
+                .map_err(|_| DbError::Internal("Primary index lock poisoned".into()))?;
+            match index.get(&composite_key)? {
+                Some(id) => id,
+                None => return Err(DbError::NotFound("Key not found".into())),
             }
-        }
-        
+        };
+
+        // 2. Read current data and update versions
+        let serialized = {
+            let mut pages = self.pages.write()
+                .map_err(|_| DbError::Internal("Pages lock poisoned".into()))?;
+            let page = pages.read_page(data_page_id)?;
+            let mut versions = Self::deserialize_mvcc_data(&page)?;
+
+            // 3. Mark latest visible version as deleted
+            for version in versions.iter_mut() {
+                if is_visible(version, tx) {
+                    version.deleted_by = Some(tx.tx_id);
+                    break;
+                }
+            }
+
+            Self::serialize_versions(&versions)?
+        };
+
         // 4. Write back updated versions
-        let serialized = Self::serialize_versions(&versions)?;
-        let mut page = Page::new(data_page_id, PageType::Data);
-        page.payload = serialized;
-        self.pages.write_page(&page)?;
-        
-        // 5. Log deletion to WAL (B-Tree doesn't actually delete, just marks tombstone)
-        self.primary_index.wal.log_btree_delete(key, tx.tx_id)?;
-        
+        {
+            let mut pages = self.pages.write()
+                .map_err(|_| DbError::Internal("Pages lock poisoned".into()))?;
+            let mut page = Page::new(data_page_id, PageType::Data);
+            page.payload = serialized;
+            pages.write_page(&page)?;
+        }
+
+        // 5. Log deletion to WAL
+        self.wal.log_btree_delete(key, tx.tx_id)?;
+
         Ok(())
     }
     
     // RANGE SCAN - MVCC-aware
     pub fn range_scan(
-        &mut self,
+        &self,
         table_name: &str,
         start: &[u8],
         end: &[u8],
         tx: &Transaction,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DbError> {
         let mut results = Vec::new();
-        
+
         // Create composite range bounds
         let composite_start = create_composite_key(table_name, start);
         let composite_end = create_composite_key(table_name, end);
 
         // 1. Get key-page_id pairs from B-Tree range (using composite keys)
-        let key_page_pairs = self.primary_index.range(&composite_start, &composite_end)?;
-        
+        let key_page_pairs = {
+            let mut index = self.primary_index.lock()
+                .map_err(|_| DbError::Internal("Primary index lock poisoned".into()))?;
+            index.range(&composite_start, &composite_end)?
+        };
+
         // 2. For each composite key, extract original key and check visibility
         for (composite_key, page_id) in key_page_pairs {
             // Extract the original key from the composite key
             let original_key = extract_key_from_composite(&composite_key)
                 .ok_or_else(|| DbError::Corruption("Invalid composite key format".into()))?
                 .to_vec();
-            
-            let page = self.pages.read_page(page_id)?;
-            let versions = self.deserialize_mvcc_data(&page)?;
-            
+
+            let page = {
+                let mut pages = self.pages.write()
+                    .map_err(|_| DbError::Internal("Pages lock poisoned".into()))?;
+                pages.read_page(page_id)?
+            };
+            let versions = Self::deserialize_mvcc_data(&page)?;
+
             // Find visible version
             for version in versions {
                 if is_visible(&version, tx) && version.deleted_by.is_none() {
@@ -194,13 +262,14 @@ impl StorageEngine {
                 }
             }
         }
-        
+
         Ok(results)
     }
 
-    pub fn get_table_entry(&self, table_name: &str, composite_key: &[u8]) -> Option<&VersionChain> {
+    pub fn get_table_entry(&self, table_name: &str, composite_key: &[u8]) -> Option<VersionChain> {
         let original_key = extract_key_from_composite(composite_key)?;
-        self.tables.get(table_name)?.rows.get(original_key)
+        let tables = self.tables.read().ok()?;
+        tables.get(table_name)?.rows.get(original_key).cloned()
     }
 
     fn serialize_versions(versions: &[RowVersion]) -> Result<Vec<u8>, DbError> {
@@ -238,7 +307,7 @@ impl StorageEngine {
         }
     }
 
-    fn deserialize_mvcc_data(&self, page: &Page) -> Result<Vec<RowVersion>, DbError> {
+    fn deserialize_mvcc_data(page: &Page) -> Result<Vec<RowVersion>, DbError> {
         let mut versions = Vec::new();
         let mut cursor = 0;
         

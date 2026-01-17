@@ -159,21 +159,21 @@ pub enum Node {
 
 // extend WalWriter impl
 impl WalWriter {
-    pub fn log_btree_insert(&mut self, key: &[u8], value: PageId, tx_id: TxId) -> Result<()> {
+    pub fn log_btree_insert(&self, key: &[u8], value: PageId, tx_id: TxId) -> Result<()> {
         let record = WalRecord::Put {
             tx: tx_id,
-            table_id:  BTREE_TABLE_ID as u32,
+            table_id: BTREE_TABLE_ID as u32,
             key: key.to_vec(),
             value: value.to_le_bytes().to_vec(),
         };
-        
+
         self.append(record)
     }
 
-    pub fn log_btree_delete(&mut self, key: &[u8], tx_id: TxId) -> Result<()> {
+    pub fn log_btree_delete(&self, key: &[u8], tx_id: TxId) -> Result<()> {
         let record = WalRecord::Delete {
             tx: tx_id,
-            table_id:  BTREE_TABLE_ID as u32,
+            table_id: BTREE_TABLE_ID as u32,
             key: key.to_vec(),
         };
         self.append(record)

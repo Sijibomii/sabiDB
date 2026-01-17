@@ -192,7 +192,7 @@ pub struct ClientState {
 }
 
 /// Server metrics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ServerMetrics {
     pub connections: usize,
     pub subscriptions: usize,
