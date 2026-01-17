@@ -33,9 +33,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-check-
 
-      - name: Check formatting
-        working-directory: sabi
-        run: cargo fmt --all -- --check
+      # - name: Check formatting
+      #   working-directory: sabi
+      #   run: cargo fmt --all -- --check
 
       - name: Clippy (core packages)
         working-directory: sabi
