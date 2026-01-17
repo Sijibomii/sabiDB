@@ -1,5 +1,4 @@
 use serde::{Serialize, Deserialize};
-use crate::error::DbError;
 use crate::tx::TxId;
 
 /// Client → Server messages
